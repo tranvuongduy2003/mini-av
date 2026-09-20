@@ -17,18 +17,19 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-04 are implemented. The `miniav` binary provides the complete
+FR-01 through FR-05 are implemented. The `miniav` binary provides the complete
 command surface, a loopback-only Core control endpoint, status reporting, and
 graceful shutdown. The protocol and IPC packages provide validated Scanner
 Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
 verdicts. The process and coordinator packages provide child-process spawning,
 exit observation, isolated worker failure state, and `UNAVAILABLE` results for
-pending worker requests.
+pending worker requests. The signatures package provides UTF-8 database
+loading, literal streaming matches, immutable snapshots, and atomic reloads.
 
 Worker executables, worker configuration, scan routing and aggregation,
-timeouts, signature reload, and worker updates remain pending in later
-functional requirements. The `scan`, `reload`, and `update` commands therefore
-continue to return a clear unavailable error from Core.
+timeouts, Core-to-worker reload routing, and worker updates remain pending in
+later functional requirements. The `scan`, `reload`, and `update` commands
+therefore continue to return a clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -200,9 +201,14 @@ Scanned files are opened read-only and are never executed.
 
 A signature database is a UTF-8 text file containing one literal pattern per
 line. Blank lines and lines beginning with `#` are ignored, and duplicate
-patterns are removed. Reloading prepares and validates a new immutable
-database before publishing it; a failed reload leaves the current database
-unchanged.
+patterns are removed. Pattern whitespace and case are significant. Reloading
+prepares and validates a new immutable database before atomically publishing
+it; a failed reload leaves the current database unchanged. A scan already in
+progress finishes against the immutable snapshot it acquired before a reload.
+
+The signature store is implemented as a reusable worker component. The Core
+`reload` command remains unavailable until worker startup and routing are
+implemented.
 
 ## Worker releases
 
@@ -231,11 +237,11 @@ go test -race ./...
 
 ## Roadmap
 
-- [ ] Standalone scanner and signature matching
+- [ ] Standalone scanner
+- [x] Signature database, streaming matching, and atomic reload
 - [x] Scanner Protocol v1 over standard streams
 - [x] Child-process supervision and crash isolation
 - [ ] Coordinator and multi-worker aggregation
-- [ ] Atomic signature reload
 - [ ] Blue/green worker updates and rollback
 - [ ] End-to-end local demonstration
 
