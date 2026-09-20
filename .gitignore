@@ -1,0 +1,9 @@
+/bin/
+/dist/
+/.local/
+/.codex-log/
+/coverage.out
+*.exe
+*.test
+/releases/**/staging/
+AGENTS.md

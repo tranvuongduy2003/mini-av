@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Format, vet, and dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l .
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($unformatted) {
+            Write-Output "The following files need gofmt:"
+            Write-Output $unformatted
+            exit 1
+          }
+
+      - name: Verify standard-library-only module
+        shell: pwsh
+        run: |
+          $external = go list -m -f '{{if not .Main}}{{.Path}}{{end}}' all
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($external) {
+            Write-Output "External Go modules are not allowed:"
+            Write-Output $external
+            exit 1
+          }
+
+      - name: Vet
+        shell: pwsh
+        run: |
+          $packages = go list ./... 2>$null
+          if (-not $packages) {
+            Write-Output "No Go packages yet; skipping vet."
+            exit 0
+          }
+          go vet ./...
+          exit $LASTEXITCODE
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $packages = go list ./... 2>$null
+          if (-not $packages) {
+            Write-Output "No Go packages yet; skipping tests."
+            exit 0
+          }
+          go test ./...
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          go test -race ./...
+          exit $LASTEXITCODE
