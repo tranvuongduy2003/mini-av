@@ -17,9 +17,11 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-MiniAV is currently in the design and scaffolding phase. The commands and
-runtime behavior below describe the planned interface; they are not yet
-implemented.
+FR-01 is implemented. The `miniav` binary provides the complete command
+surface, a loopback-only Core control endpoint, status reporting, and graceful
+shutdown. Scanner, signature reload, and worker update runtime behavior remains
+pending in later functional requirements; those commands currently return a
+clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -77,7 +79,7 @@ directly terminate Core or another worker.
 See [the architecture guide](docs/architecture.md) for component boundaries,
 worker lifecycle states, and concurrency rules.
 
-## Planned CLI
+## CLI
 
 ```text
 miniav serve --config <path>
@@ -96,6 +98,49 @@ miniav shutdown
 | `reload` | Replace one worker's in-memory signature database. |
 | `update` | Validate and activate a new worker release. |
 | `shutdown` | Gracefully stop Core and reap all child processes. |
+
+Start Core with an existing regular file as the configuration path:
+
+```sh
+go run ./cmd/miniav serve --config <path>
+```
+
+Alternatively, build the platform-specific `miniav` executable in the
+repository root:
+
+```sh
+make build
+```
+
+In another terminal, query or stop the running Core:
+
+```sh
+go run ./cmd/miniav status
+go run ./cmd/miniav shutdown
+```
+
+Core listens on the loopback-only control address `127.0.0.1:7331`. FR-01
+reserves configuration parsing for the requirement that defines the schema, so
+the current `serve` command validates that the supplied path is a regular file
+without interpreting its contents.
+
+## Development commands
+
+```sh
+make fmt
+make vet
+make test
+make test-race
+make check
+```
+
+`make check` formats the Go source and runs every required verification gate.
+Run any CLI command by passing its arguments through `ARGS`:
+
+```sh
+make run ARGS="status"
+make run ARGS="serve --config <path>"
+```
 
 ## Scanner protocol
 

@@ -44,10 +44,18 @@ live in independent worker processes.
 - `scan`, `status`, `reload`, and `update` send requests to a running Core.
 - `shutdown` requests a graceful system stop.
 
-The CLI-to-Core transport is intentionally not selected by the PRD. It must be
-defined while implementing FR-01. A loopback-only TCP protocol is the portable
-standard-library option; platform-native named pipes require separate Windows
-and Unix implementations.
+The CLI-to-Core transport is newline-delimited JSON over TCP at
+`127.0.0.1:7331`. The listener accepts only a literal loopback IP, each
+connection carries one command and one response, frames are limited to 64 KiB,
+and requests have a bounded deadline. This keeps the control path portable and
+within the standard library without conflating it with Scanner Protocol v1.
+
+FR-01 implements Core liveness/status and graceful shutdown on this transport.
+It validates the `serve` configuration path as a regular file, while the
+configuration schema remains deferred until a requirement defines it. The
+`scan`, `reload`, and `update` commands are accepted and transported but return
+an explicit unavailable response until their runtime requirements are
+implemented.
 
 ### Coordinator
 
