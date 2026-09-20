@@ -17,7 +17,7 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-05 are implemented. The `miniav` binary provides the complete
+FR-01 through FR-06 are implemented. The `miniav` binary provides the complete
 command surface, a loopback-only Core control endpoint, status reporting, and
 graceful shutdown. The protocol and IPC packages provide validated Scanner
 Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
@@ -25,11 +25,13 @@ verdicts. The process and coordinator packages provide child-process spawning,
 exit observation, isolated worker failure state, and `UNAVAILABLE` results for
 pending worker requests. The signatures package provides UTF-8 database
 loading, literal streaming matches, immutable snapshots, and atomic reloads.
+The aggregator package provides the pure `ANY_MALICIOUS` policy.
 
-Worker executables, worker configuration, scan routing and aggregation,
-timeouts, Core-to-worker reload routing, and worker updates remain pending in
-later functional requirements. The `scan`, `reload`, and `update` commands
-therefore continue to return a clear unavailable error from Core.
+Worker executables, worker configuration, scan routing, timeouts, Core-to-worker
+reload routing, and worker updates remain pending in later functional
+requirements. The aggregation policy is not yet connected to the scan command,
+so `scan`, `reload`, and `update` continue to return a clear unavailable error
+from Core.
 
 ## Hot-swap model
 
@@ -185,7 +187,7 @@ Each `SCAN_RESULT` carries exactly one of the per-worker verdicts `CLEAN`,
 `MALWARE`, `ERROR`, `TIMEOUT`, or `UNAVAILABLE`. Scanner Protocol v1 rejects
 other verdict values.
 
-The planned FR-06 runtime aggregation uses an `ANY_MALICIOUS` policy:
+The `aggregator` package implements the `ANY_MALICIOUS` policy:
 
 1. If any worker returns `MALWARE`, the combined verdict is `MALWARE`.
 2. Otherwise, if any worker returns `ERROR`, `TIMEOUT`, or `UNAVAILABLE`, the
@@ -193,7 +195,9 @@ The planned FR-06 runtime aggregation uses an `ANY_MALICIOUS` policy:
 3. If every worker returns `CLEAN`, the combined verdict is `CLEAN`.
 
 `INCONCLUSIVE` is a combined result rather than a per-worker protocol verdict.
-The aggregation runtime is not implemented yet.
+Aggregation rejects an empty set, pending results, and unknown verdicts. The
+policy is not yet wired to the scan command because worker startup and scan
+routing remain pending.
 
 Scanned files are opened read-only and are never executed.
 
@@ -241,7 +245,8 @@ go test -race ./...
 - [x] Signature database, streaming matching, and atomic reload
 - [x] Scanner Protocol v1 over standard streams
 - [x] Child-process supervision and crash isolation
-- [ ] Coordinator and multi-worker aggregation
+- [x] Coordinator state tracking and result aggregation policy
+- [ ] Worker runtime and multi-worker scan routing
 - [ ] Blue/green worker updates and rollback
 - [ ] End-to-end local demonstration
 
