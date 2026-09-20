@@ -21,6 +21,10 @@ const coreAddress = "127.0.0.1:7331"
 var miniavBinary string
 
 func TestMain(m *testing.M) {
+	if os.Getenv(processHelperEnvironment) != "" || os.Getenv(coordinatorHelperEnvironment) != "" {
+		os.Exit(m.Run())
+	}
+
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		fmt.Fprintln(os.Stderr, "locate test source")

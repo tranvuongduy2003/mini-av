@@ -17,13 +17,18 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-03 are implemented. The `miniav` binary provides the complete
+FR-01 through FR-04 are implemented. The `miniav` binary provides the complete
 command surface, a loopback-only Core control endpoint, status reporting, and
 graceful shutdown. The protocol and IPC packages provide validated Scanner
 Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
-verdicts. Scanner, aggregation, signature reload, and worker update runtime
-behavior remains pending in later functional requirements; those commands
-currently return a clear unavailable error from Core.
+verdicts. The process and coordinator packages provide child-process spawning,
+exit observation, isolated worker failure state, and `UNAVAILABLE` results for
+pending worker requests.
+
+Worker executables, worker configuration, scan routing and aggregation,
+timeouts, signature reload, and worker updates remain pending in later
+functional requirements. The `scan`, `reload`, and `update` commands therefore
+continue to return a clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -228,6 +233,7 @@ go test -race ./...
 
 - [ ] Standalone scanner and signature matching
 - [x] Scanner Protocol v1 over standard streams
+- [x] Child-process supervision and crash isolation
 - [ ] Coordinator and multi-worker aggregation
 - [ ] Atomic signature reload
 - [ ] Blue/green worker updates and rollback
