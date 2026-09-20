@@ -81,6 +81,24 @@ func TestStartReportsCrash(t *testing.T) {
 	}
 }
 
+func TestTerminateIsIdempotentAndReportsExit(t *testing.T) {
+	t.Setenv(processHelperEnvironment, "echo")
+	child, err := processmanager.Start(os.Args[0], []string{"-test.run=^TestProcessHelper$"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Terminate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Terminate(); err != nil {
+		t.Fatalf("second terminate returned an error: %v", err)
+	}
+	exit := waitForExit(t, child.Exited())
+	if exit.PID != child.PID() || exit.Err == nil {
+		t.Fatalf("exit = %#v, want terminated PID %d with an error", exit, child.PID())
+	}
+}
+
 func TestStartRejectsInvalidExecutable(t *testing.T) {
 	if child, err := processmanager.Start(" ", nil, io.Discard); err == nil || child != nil {
 		t.Fatalf("empty executable returned child %#v and error %v", child, err)

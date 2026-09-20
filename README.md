@@ -17,21 +17,24 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-06 are implemented. The `miniav` binary provides the complete
+FR-01 through FR-07 capability layers are implemented. The `miniav` binary provides the complete
 command surface, a loopback-only Core control endpoint, status reporting, and
 graceful shutdown. The protocol and IPC packages provide validated Scanner
 Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
 verdicts. The process and coordinator packages provide child-process spawning,
-exit observation, isolated worker failure state, and `UNAVAILABLE` results for
-pending worker requests. The signatures package provides UTF-8 database
-loading, literal streaming matches, immutable snapshots, and atomic reloads.
-The aggregator package provides the pure `ANY_MALICIOUS` policy.
+bounded candidate termination, version-aware lifecycle and routing state,
+isolated worker failure handling, and `UNAVAILABLE` results for pending worker
+requests. The update package strictly validates local release manifests,
+verifies SHA-256 digests, and publishes immutable staged artifacts. The
+signatures package provides UTF-8 database loading, literal streaming matches,
+immutable snapshots, and atomic reloads. The aggregator package provides the
+pure `ANY_MALICIOUS` policy.
 
-Worker executables, worker configuration, scan routing, timeouts, Core-to-worker
-reload routing, and worker updates remain pending in later functional
-requirements. The aggregation policy is not yet connected to the scan command,
-so `scan`, `reload`, and `update` continue to return a clear unavailable error
-from Core.
+Worker executables, worker configuration, Scanner Protocol handshake and health
+orchestration, scan routing, timeouts, Core-to-worker reload routing, and CLI
+update wiring remain pending runtime integration. The aggregation policy is not
+yet connected to the scan command, so `scan`, `reload`, and `update` continue to
+return a clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -217,11 +220,22 @@ implemented.
 ## Worker releases
 
 Worker releases are described by local JSON manifests containing the scanner
-ID, worker version, signature version, artifact path, and SHA-256 digest. Core
-validates the artifact before starting it. A candidate must pass startup,
-protocol handshake, and health checks before it receives new scans. The old
-worker drains its in-flight requests before shutdown, and remains active if
-the candidate fails before activation.
+ID, worker version, signature version, artifact path, and SHA-256 digest.
+Relative manifest and artifact paths resolve from the directory containing the
+Core configuration file; absolute paths remain absolute. A validated artifact
+is published beneath
+`staging/<scanner-id>/<worker-version>/<artifact-name>` in that configuration
+directory. Matching staged content is reusable, while conflicting content is
+never overwritten.
+
+Core must prepare and hash a release before starting it. A candidate becomes
+eligible for activation only after its runtime reports successful handshake and
+health events to the coordinator. Startup, handshake, health, or timeout
+failure marks only the candidate failed and leaves the previous worker active.
+After activation, the old version drains its assigned requests before
+retirement. Automatic rollback after activation is intentionally not part of
+FR-07, and the CLI `update` command remains unavailable until worker runtime
+wiring exists.
 
 ## Requirements
 
@@ -246,6 +260,7 @@ go test -race ./...
 - [x] Scanner Protocol v1 over standard streams
 - [x] Child-process supervision and crash isolation
 - [x] Coordinator state tracking and result aggregation policy
+- [x] Manifest validation, immutable staging, and pre-activation rollback state
 - [ ] Worker runtime and multi-worker scan routing
 - [ ] Blue/green worker updates and rollback
 - [ ] End-to-end local demonstration

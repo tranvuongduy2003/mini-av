@@ -116,10 +116,12 @@ and stages candidate artifacts. It never changes active routing by itself;
 activation is a coordinator state transition after the candidate has passed
 startup, protocol handshake, and health checks.
 
-Relative-path resolution is not defined by the PRD. FR-07 must choose one
-deterministic base—preferably the configuration file directory or an explicit
-data directory—and apply it consistently to manifests, artifacts, signatures,
-and runtime data.
+Relative manifest and artifact paths resolve from the directory containing the
+Core configuration file; absolute paths remain absolute. Validated artifacts
+are published immutably beneath
+`staging/<scanner-id>/<worker-version>/<artifact-name>` in that directory.
+Other runtime path-bearing features must use the same base when they are wired
+into Core.
 
 ## Worker lifecycle
 
@@ -167,9 +169,11 @@ STARTING -> HEALTHY -> ACTIVE -> DRAINING -> RETIRED
    worker.
 6. Shut down and retire the old worker after its in-flight count reaches zero.
 
-Any failure before activation leaves the previous worker active. A candidate
-failure after activation is reported to the coordinator so it can apply the
-rollback policy defined by FR-07.
+Any failure before activation marks only the candidate failed and leaves the
+previous worker active. After activation, an unexpected candidate exit follows
+the normal failure-isolation path: the active route is removed and pending
+results become unavailable. FR-07 does not reactivate the draining worker after
+cutover.
 
 ## Concurrency and shutdown rules
 

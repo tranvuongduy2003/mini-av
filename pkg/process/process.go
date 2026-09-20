@@ -1,10 +1,13 @@
 package process
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 type Exit struct {
@@ -14,10 +17,13 @@ type Exit struct {
 }
 
 type Child struct {
-	pid    int
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	exited <-chan Exit
+	pid          int
+	process      *os.Process
+	stdin        io.WriteCloser
+	stdout       io.ReadCloser
+	exited       <-chan Exit
+	terminate    sync.Once
+	terminateErr error
 }
 
 func Start(executable string, args []string, stderr io.Writer) (*Child, error) {
@@ -48,10 +54,11 @@ func Start(executable string, args []string, stderr io.Writer) (*Child, error) {
 
 	exited := make(chan Exit, 1)
 	child := &Child{
-		pid:    command.Process.Pid,
-		stdin:  stdin,
-		stdout: stdout,
-		exited: exited,
+		pid:     command.Process.Pid,
+		process: command.Process,
+		stdin:   stdin,
+		stdout:  stdout,
+		exited:  exited,
 	}
 	go func() {
 		err := command.Wait()
@@ -79,4 +86,14 @@ func (child *Child) Stdout() io.ReadCloser {
 
 func (child *Child) Exited() <-chan Exit {
 	return child.exited
+}
+
+func (child *Child) Terminate() error {
+	child.terminate.Do(func() {
+		child.terminateErr = child.process.Kill()
+		if errors.Is(child.terminateErr, os.ErrProcessDone) {
+			child.terminateErr = nil
+		}
+	})
+	return child.terminateErr
 }
