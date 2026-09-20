@@ -17,12 +17,13 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 and FR-02 are implemented. The `miniav` binary provides the complete
+FR-01 through FR-03 are implemented. The `miniav` binary provides the complete
 command surface, a loopback-only Core control endpoint, status reporting, and
 graceful shutdown. The protocol and IPC packages provide validated Scanner
-Protocol v1 messages and bounded NDJSON framing. Scanner, signature reload, and
-worker update runtime behavior remains pending in later functional requirements;
-those commands currently return a clear unavailable error from Core.
+Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
+verdicts. Scanner, aggregation, signature reload, and worker update runtime
+behavior remains pending in later functional requirements; those commands
+currently return a clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -172,14 +173,21 @@ Complete example streams are available in
 and
 [`samples/protocol-v1/worker-to-core.ndjson`](samples/protocol-v1/worker-to-core.ndjson).
 
-## Verdict aggregation
+## Verdicts and aggregation
 
-MiniAV uses an `ANY_MALICIOUS` policy:
+Each `SCAN_RESULT` carries exactly one of the per-worker verdicts `CLEAN`,
+`MALWARE`, `ERROR`, `TIMEOUT`, or `UNAVAILABLE`. Scanner Protocol v1 rejects
+other verdict values.
+
+The planned FR-06 runtime aggregation uses an `ANY_MALICIOUS` policy:
 
 1. If any worker returns `MALWARE`, the combined verdict is `MALWARE`.
 2. Otherwise, if any worker returns `ERROR`, `TIMEOUT`, or `UNAVAILABLE`, the
    combined verdict is `INCONCLUSIVE`.
 3. If every worker returns `CLEAN`, the combined verdict is `CLEAN`.
+
+`INCONCLUSIVE` is a combined result rather than a per-worker protocol verdict.
+The aggregation runtime is not implemented yet.
 
 Scanned files are opened read-only and are never executed.
 

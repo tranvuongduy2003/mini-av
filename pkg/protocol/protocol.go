@@ -26,6 +26,14 @@ const (
 
 type Verdict string
 
+const (
+	VerdictClean       Verdict = "CLEAN"
+	VerdictMalware     Verdict = "MALWARE"
+	VerdictError       Verdict = "ERROR"
+	VerdictTimeout     Verdict = "TIMEOUT"
+	VerdictUnavailable Verdict = "UNAVAILABLE"
+)
+
 type Message struct {
 	Version        int      `json:"version"`
 	Type           string   `json:"type"`
@@ -108,8 +116,8 @@ func Validate(message Message) error {
 		if message.RequestID == 0 {
 			return errors.New("SCAN_RESULT requires a non-zero request_id")
 		}
-		if strings.TrimSpace(string(message.Verdict)) == "" {
-			return errors.New("SCAN_RESULT requires a non-empty verdict")
+		if !validVerdict(message.Verdict) {
+			return fmt.Errorf("SCAN_RESULT verdict %q must be CLEAN, MALWARE, ERROR, TIMEOUT, or UNAVAILABLE", message.Verdict)
 		}
 		if message.DurationMs < 0 {
 			return errors.New("SCAN_RESULT duration_ms must not be negative")
@@ -129,6 +137,15 @@ func Validate(message Message) error {
 	}
 
 	return validateAllowedFields(message)
+}
+
+func validVerdict(verdict Verdict) bool {
+	switch verdict {
+	case VerdictClean, VerdictMalware, VerdictError, VerdictTimeout, VerdictUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 func Marshal(message Message) ([]byte, error) {

@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,7 +18,7 @@ func TestProtocolMessagesRoundTrip(t *testing.T) {
 		{Version: protocol.Version, Type: protocol.TypeShutdown},
 		{Version: protocol.Version, Type: protocol.TypeHelloAck, ScannerID: "scanner-a", WorkerVersion: "1.0.0", Capabilities: []string{"file_scan", "reload"}},
 		{Version: protocol.Version, Type: protocol.TypeHealthResult, Status: "ok"},
-		{Version: protocol.Version, Type: protocol.TypeScanResult, RequestID: 101, Verdict: "MALWARE", Signature: "VIRUS_SAMPLE_XYZ", DurationMs: 12},
+		{Version: protocol.Version, Type: protocol.TypeScanResult, RequestID: 101, Verdict: protocol.VerdictMalware, Signature: "VIRUS_SAMPLE_XYZ", DurationMs: 12},
 		{Version: protocol.Version, Type: protocol.TypeReloadResult, Success: true, SignatureCount: 50},
 		{Version: protocol.Version, Type: protocol.TypeShutdownAck},
 	}
@@ -34,6 +35,68 @@ func TestProtocolMessagesRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(decoded, message) {
 				t.Fatalf("decoded = %#v, want %#v", decoded, message)
+			}
+		})
+	}
+}
+
+func TestProtocolScanResultVerdictsRoundTrip(t *testing.T) {
+	verdicts := []protocol.Verdict{
+		protocol.VerdictClean,
+		protocol.VerdictMalware,
+		protocol.VerdictError,
+		protocol.VerdictTimeout,
+		protocol.VerdictUnavailable,
+	}
+
+	for _, verdict := range verdicts {
+		t.Run(string(verdict), func(t *testing.T) {
+			message := protocol.Message{
+				Version:   protocol.Version,
+				Type:      protocol.TypeScanResult,
+				RequestID: 1,
+				Verdict:   verdict,
+			}
+			data, err := protocol.Marshal(message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), `"verdict":"`+string(verdict)+`"`) {
+				t.Fatalf("message = %s, want verdict %q", data, verdict)
+			}
+			decoded, err := protocol.Unmarshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded, message) {
+				t.Fatalf("decoded = %#v, want %#v", decoded, message)
+			}
+		})
+	}
+}
+
+func TestProtocolRejectsInvalidScanResultVerdicts(t *testing.T) {
+	verdicts := []protocol.Verdict{"", "UNKNOWN", "clean", " CLEAN "}
+
+	for _, verdict := range verdicts {
+		name := string(verdict)
+		if name == "" {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			message := protocol.Message{
+				Version:   protocol.Version,
+				Type:      protocol.TypeScanResult,
+				RequestID: 1,
+				Verdict:   verdict,
+			}
+			if err := protocol.Validate(message); err == nil || !strings.Contains(err.Error(), "verdict") {
+				t.Fatalf("Validate error = %v, want verdict error", err)
+			}
+
+			data := `{"version":1,"type":"SCAN_RESULT","request_id":1,"verdict":` + fmt.Sprintf("%q", verdict) + `,"duration_ms":0}`
+			if _, err := protocol.Unmarshal([]byte(data)); err == nil || !strings.Contains(err.Error(), "verdict") {
+				t.Fatalf("Unmarshal error = %v, want verdict error", err)
 			}
 		})
 	}
