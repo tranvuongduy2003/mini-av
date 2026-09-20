@@ -1,0 +1,5 @@
+{"version":1,"type":"HELLO_ACK","scanner_id":"scanner-a","worker_version":"1.0.0","capabilities":["file_scan","reload"]}
+{"version":1,"type":"HEALTH_RESULT","status":"ok"}
+{"version":1,"type":"SCAN_RESULT","request_id":101,"verdict":"MALWARE","signature":"VIRUS_SAMPLE_XYZ","duration_ms":12}
+{"version":1,"type":"RELOAD_RESULT","success":true,"signature_count":50}
+{"version":1,"type":"SHUTDOWN_ACK"}

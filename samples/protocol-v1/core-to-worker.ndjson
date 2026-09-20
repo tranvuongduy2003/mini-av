@@ -1,0 +1,6 @@
+{
+  "version":1,"type":"HELLO"}
+{"version":1,"type":"HEALTH_CHECK"}
+{"version":1,"type":"SCAN","request_id":101,"file_path":"C:\\samples\\clean.txt"}
+{"version":1,"type":"RELOAD","signature_path":"C:\\samples\\signatures.txt"}
+{"version":1,"type":"SHUTDOWN"}

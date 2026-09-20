@@ -17,11 +17,12 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 is implemented. The `miniav` binary provides the complete command
-surface, a loopback-only Core control endpoint, status reporting, and graceful
-shutdown. Scanner, signature reload, and worker update runtime behavior remains
-pending in later functional requirements; those commands currently return a
-clear unavailable error from Core.
+FR-01 and FR-02 are implemented. The `miniav` binary provides the complete
+command surface, a loopback-only Core control endpoint, status reporting, and
+graceful shutdown. The protocol and IPC packages provide validated Scanner
+Protocol v1 messages and bounded NDJSON framing. Scanner, signature reload, and
+worker update runtime behavior remains pending in later functional requirements;
+those commands currently return a clear unavailable error from Core.
 
 ## Hot-swap model
 
@@ -146,7 +147,9 @@ make run ARGS="serve --config <path>"
 
 Core and workers use Scanner Protocol v1: one JSON object per line over
 `stdin` and `stdout`. Worker diagnostics go to `stderr` so logs cannot corrupt
-the protocol stream.
+the protocol stream. Frames are limited to 64 KiB and messages with an unknown
+field, unsupported protocol version, unknown type, missing required field, or
+missing terminating newline are rejected.
 
 Example request:
 
@@ -161,7 +164,13 @@ Example response:
 ```
 
 The protocol also defines messages for handshake, health checks, signature
-reloads, and graceful shutdown.
+reloads, and graceful shutdown. `HELLO_ACK` uses `version` for the numeric
+protocol version and `worker_version` for the worker release version.
+
+Complete example streams are available in
+[`samples/protocol-v1/core-to-worker.ndjson`](samples/protocol-v1/core-to-worker.ndjson)
+and
+[`samples/protocol-v1/worker-to-core.ndjson`](samples/protocol-v1/worker-to-core.ndjson).
 
 ## Verdict aggregation
 
@@ -210,7 +219,7 @@ go test -race ./...
 ## Roadmap
 
 - [ ] Standalone scanner and signature matching
-- [ ] Scanner Protocol v1 over standard streams
+- [x] Scanner Protocol v1 over standard streams
 - [ ] Coordinator and multi-worker aggregation
 - [ ] Atomic signature reload
 - [ ] Blue/green worker updates and rollback
