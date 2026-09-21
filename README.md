@@ -5,9 +5,10 @@ engineering in Go.**
 
 MiniAV coordinates independent scanner processes behind a stable Core. Scanner
 engines and signature databases can be replaced while Core stays online,
-in-flight scans finish safely, and failed candidates leave the working engine
-in place. The project explores process isolation, three-transport IPC, actor-style
-concurrency, health-gated activation, graceful draining, and rollback.
+in-flight scans finish safely, and candidates that fail before activation leave
+the active engine in place. The project explores process isolation,
+three-transport IPC, actor-style concurrency, health-gated activation, graceful
+draining, and failure isolation.
 
 > [!WARNING]
 > MiniAV is a learning project, not production antivirus software. It does not
@@ -34,11 +35,14 @@ lifecycle:
 3. Require a successful protocol handshake and health check.
 4. Route new scans to the candidate in one coordinator transition.
 5. Let the previous worker finish its assigned scans before shutting it down.
-6. Keep or restore the last healthy worker if activation fails.
+6. If the candidate fails before activation, mark it failed and leave the
+   current active worker unchanged.
 
 Core keeps the same process ID throughout this lifecycle. Scanner crashes are
 contained to their child process and converted into explicit scan or update
-results.
+results. After activation, an unexpected candidate exit removes that active
+route and makes pending results unavailable; Core does not reactivate the
+already-draining generation.
 
 ## Platform goals
 
@@ -49,11 +53,17 @@ results.
 - Reload signatures without restarting Core or a worker.
 - Run one stdio worker, one loopback TCP socket worker, and one gRPC worker.
 - Keep routing and lifecycle state inside a single coordinator goroutine.
-- Keep third-party code limited to the official Go gRPC implementation.
+- Keep direct third-party dependencies limited to the official Go gRPC and
+  Protobuf implementations.
 
 ## Architecture
 
 ```text
+Docker host (loopback only)
+  publish script -> release files -> nginx :8080
+                                      |
+                                      | HTTP + SHA-256 manifest
+                                      v
 User / CLI
     |
     v
@@ -76,6 +86,10 @@ Core is scanner-agnostic. Each worker owns its matching logic and in-memory
 signature database, while the coordinator owns worker state, routing,
 in-flight requests, timeouts, and update transitions. A crashed worker cannot
 directly terminate Core or another worker.
+
+Workers move through `STARTING -> HEALTHY -> ACTIVE -> DRAINING -> RETIRED`.
+A crash, failed health check, activation timeout, or unexpected exit moves the
+affected worker to `FAILED`.
 
 See [the architecture guide](docs/architecture.md) for component boundaries,
 worker lifecycle states, and concurrency rules.
@@ -105,13 +119,6 @@ Build Core and all three workers, then start Core with the supplied configuratio
 ```sh
 make build
 ./miniav serve --config config/miniav.json
-```
-
-Alternatively, build the platform-specific `miniav` executable in the
-repository root:
-
-```sh
-make build
 ```
 
 In another terminal, query or stop the running Core:
@@ -283,7 +290,8 @@ Core PID, and shuts the system down.
 
 - Go 1.22 or newer
 - Windows x64, Linux, or macOS
-- `google.golang.org/grpc` and its Go module dependencies
+- `google.golang.org/grpc`, `google.golang.org/protobuf`, and their indirect Go
+  module dependencies
 - No native toolchain dependencies
 - `protoc`, `protoc-gen-go`, and `protoc-gen-go-grpc` only when regenerating stubs
 
