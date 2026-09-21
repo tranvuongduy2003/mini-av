@@ -6,11 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	updatemanager "miniav/pkg/update"
 )
@@ -250,6 +254,176 @@ func TestPrepareHonorsCancellationWithoutPublishing(t *testing.T) {
 	stagedPath := filepath.Join(base, "staging", "scanner-a", "2.0.0", filepath.Base(artifact))
 	if _, err := os.Stat(stagedPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("canceled prepare published %q: %v", stagedPath, err)
+	}
+}
+
+func TestPrepareDownloadsAndStagesLoopbackRelease(t *testing.T) {
+	base := t.TempDir()
+	artifactName := executableName("scanner-a")
+	content := []byte("remote candidate worker")
+	digest := sha256.Sum256(content)
+	manifest := updatemanager.Manifest{
+		ScannerID:        "scanner-a",
+		WorkerVersion:    "2.0.0",
+		SignatureVersion: "2",
+		ArtifactPath:     artifactName,
+		SHA256:           strings.ToUpper(hex.EncodeToString(digest[:])),
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/releases/scanner-a/2.0.0/manifest.json":
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write(manifestData)
+		case "/releases/scanner-a/2.0.0/" + artifactName:
+			writer.Write(content)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	manifestURL := server.URL + "/releases/scanner-a/2.0.0/manifest.json"
+	prepared, err := updatemanager.Prepare(context.Background(), base, manifestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSource := server.URL + "/releases/scanner-a/2.0.0/" + artifactName
+	wantStaged := filepath.Join(base, "staging", "scanner-a", "2.0.0", artifactName)
+	if prepared.ManifestPath != manifestURL || prepared.SourcePath != wantSource || prepared.StagedPath != wantStaged {
+		t.Fatalf("prepared remote release = %#v", prepared)
+	}
+	if prepared.Manifest.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("normalized SHA-256 = %q", prepared.Manifest.SHA256)
+	}
+	staged, err := os.ReadFile(prepared.StagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(staged) != string(content) {
+		t.Fatalf("staged content = %q, want %q", staged, content)
+	}
+}
+
+func TestPrepareRemoteRejectsUnsafeSourcesAndInvalidDownloads(t *testing.T) {
+	base := t.TempDir()
+	if _, err := updatemanager.Prepare(context.Background(), base, "http://192.0.2.1/manifest.json"); err == nil || !strings.Contains(err.Error(), "literal loopback IP") {
+		t.Fatalf("non-loopback source error = %v", err)
+	}
+
+	content := []byte("candidate")
+	digest := sha256.Sum256(content)
+	tests := []struct {
+		name       string
+		manifest   func(string) updatemanager.Manifest
+		handler    func(http.ResponseWriter, *http.Request)
+		want       string
+		manifestOK bool
+	}{
+		{
+			name: "absolute artifact URL",
+			manifest: func(origin string) updatemanager.Manifest {
+				return remoteManifest(origin+"/worker", digest)
+			},
+			want:       "relative URL",
+			manifestOK: true,
+		},
+		{
+			name: "artifact hash mismatch",
+			manifest: func(string) updatemanager.Manifest {
+				return remoteManifest("worker", sha256.Sum256([]byte("different")))
+			},
+			handler: func(writer http.ResponseWriter, request *http.Request) {
+				writer.Write(content)
+			},
+			want:       "SHA-256 mismatch",
+			manifestOK: true,
+		},
+		{
+			name: "artifact too large",
+			manifest: func(string) updatemanager.Manifest {
+				return remoteManifest("worker", digest)
+			},
+			handler: func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Length", fmt.Sprint(128*1024*1024+1))
+				writer.WriteHeader(http.StatusOK)
+			},
+			want:       "size limit",
+			manifestOK: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var origin string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/manifest.json" && test.manifestOK {
+					data, err := json.Marshal(test.manifest(origin))
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					writer.Write(data)
+					return
+				}
+				if test.handler != nil {
+					test.handler(writer, request)
+					return
+				}
+				http.NotFound(writer, request)
+			}))
+			origin = server.URL
+			defer server.Close()
+
+			_, err := updatemanager.Prepare(context.Background(), base, server.URL+"/manifest.json")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestPrepareRemoteRejectsRedirectAndHonorsTimeout(t *testing.T) {
+	base := t.TempDir()
+	redirect := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, "/elsewhere", http.StatusFound)
+	}))
+	defer redirect.Close()
+	if _, err := updatemanager.Prepare(context.Background(), base, redirect.URL+"/manifest.json"); err == nil || !strings.Contains(err.Error(), "redirects are not allowed") {
+		t.Fatalf("redirect error = %v", err)
+	}
+
+	content := []byte("candidate")
+	digest := sha256.Sum256(content)
+	manifestData, err := json.Marshal(remoteManifest("worker", digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	timedOut := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/manifest.json" {
+			writer.Write(manifestData)
+			return
+		}
+		<-request.Context().Done()
+	}))
+	defer timedOut.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := updatemanager.Prepare(ctx, base, timedOut.URL+"/manifest.json"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timed out prepare error = %v, want context deadline", err)
+	}
+}
+
+func remoteManifest(artifactPath string, digest [sha256.Size]byte) updatemanager.Manifest {
+	return updatemanager.Manifest{
+		ScannerID:        "scanner-a",
+		WorkerVersion:    "2.0.0",
+		SignatureVersion: "2",
+		ArtifactPath:     artifactPath,
+		SHA256:           hex.EncodeToString(digest[:]),
 	}
 }
 

@@ -8,5 +8,5 @@ import (
 )
 
 func main() {
-	os.Exit(worker.Main("scanner-a", workertransport.Stdio))
+	os.Exit(worker.Main("scanner-c", workertransport.GRPC))
 }

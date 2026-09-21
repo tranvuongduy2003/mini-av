@@ -34,6 +34,18 @@ func Run(ctx context.Context, config Config, input io.Reader, output io.Writer) 
 	if input == nil || output == nil {
 		return errors.New("worker input and output must not be nil")
 	}
+	decoder := ipc.NewDecoder(input)
+	encoder := ipc.NewEncoder(output)
+	return RunSession(ctx, config, decoder.Decode, encoder.Encode)
+}
+
+func RunSession(ctx context.Context, config Config, receive func() (protocol.Message, error), send func(protocol.Message) error) error {
+	if err := validateConfig(config); err != nil {
+		return err
+	}
+	if receive == nil || send == nil {
+		return errors.New("worker receive and send functions must not be nil")
+	}
 	store, err := signatures.NewStore(config.SignaturePath)
 	if err != nil {
 		return err
@@ -45,14 +57,12 @@ func Run(ctx context.Context, config Config, input io.Reader, output io.Writer) 
 		config.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	decoder := ipc.NewDecoder(input)
-	encoder := ipc.NewEncoder(output)
 	var writes sync.Mutex
 	var scans sync.WaitGroup
 	write := func(message protocol.Message) error {
 		writes.Lock()
 		defer writes.Unlock()
-		return encoder.Encode(message)
+		return send(message)
 	}
 
 	for {
@@ -60,7 +70,7 @@ func Run(ctx context.Context, config Config, input io.Reader, output io.Writer) 
 			scans.Wait()
 			return err
 		}
-		message, err := decoder.Decode()
+		message, err := receive()
 		if err != nil {
 			scans.Wait()
 			if errors.Is(err, io.EOF) {

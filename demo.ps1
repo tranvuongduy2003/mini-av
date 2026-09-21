@@ -9,6 +9,7 @@ $exe = if ($IsWindows -or $env:OS -eq "Windows_NT") { ".exe" } else { "" }
 $miniav = Join-Path $bin "miniav$exe"
 $scannerA = Join-Path $bin "scanner-a$exe"
 $scannerB = Join-Path $bin "scanner-b$exe"
+$scannerC = Join-Path $bin "scanner-c$exe"
 
 & go build -o $miniav ./cmd/miniav
 if ($LASTEXITCODE -ne 0) { throw "build miniav failed" }
@@ -16,15 +17,16 @@ if ($LASTEXITCODE -ne 0) { throw "build miniav failed" }
 if ($LASTEXITCODE -ne 0) { throw "build scanner-a failed" }
 & go build -o $scannerB ./cmd/scanner-b
 if ($LASTEXITCODE -ne 0) { throw "build scanner-b failed" }
+& go build -o $scannerC ./cmd/scanner-c
+if ($LASTEXITCODE -ne 0) { throw "build scanner-c failed" }
 
 $config = Join-Path $demo "miniav.json"
 $configJson = @{
     startupTimeoutMs = 3000
     scanTimeoutMs = 1500
-    workers = @(
-        @{ scannerId = "scanner-a"; workerVersion = "1.0.0"; executable = $scannerA; signaturePath = (Join-Path $root "samples\signatures-a.txt"); delayMs = 500 },
-        @{ scannerId = "scanner-b"; workerVersion = "1.0.0"; executable = $scannerB; signaturePath = (Join-Path $root "samples\signatures-b.txt") }
-    )
+    stdioWorker = @{ scannerId = "scanner-a"; workerVersion = "1.0.0"; executable = $scannerA; signaturePath = (Join-Path $root "samples\signatures-a.txt"); delayMs = 500 }
+    socketWorker = @{ scannerId = "scanner-b"; workerVersion = "1.0.0"; executable = $scannerB; signaturePath = (Join-Path $root "samples\signatures-b.txt") }
+    grpcWorker = @{ scannerId = "scanner-c"; workerVersion = "1.0.0"; executable = $scannerC; signaturePath = (Join-Path $root "samples\signatures-c.txt") }
 } | ConvertTo-Json -Depth 4
 [System.IO.File]::WriteAllText($config, $configJson, [System.Text.UTF8Encoding]::new($false))
 

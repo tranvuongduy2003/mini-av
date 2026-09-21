@@ -3,7 +3,7 @@
 ## Purpose
 
 MiniAV is a local, educational simulation of a multi-engine antivirus system.
-It demonstrates child-process isolation, pipe-based IPC, actor-style state
+It demonstrates child-process isolation, three-transport IPC, actor-style state
 ownership, in-memory signature reloads, and blue/green worker replacement.
 
 The system is not a production antivirus. It scans only harmless developer
@@ -13,6 +13,11 @@ scanned content.
 ## System context
 
 ```text
+Docker host (loopback only)
+  publish script -> release files -> nginx :8080
+                                      |
+                                      | HTTP + SHA-256 manifest
+                                      v
 User / CLI
     |
     v
@@ -23,12 +28,12 @@ User / CLI
 |                 process and IPC events                        |
 |                         |                                     |
 +-------------------------|-------------------------------------+
-                          | NDJSON over stdin/stdout
-                 +--------+--------+
-                 |                 |
-                 v                 v
-          Scanner A process  Scanner B process
-          signature store    signature store
+                          | stdio / TCP socket / gRPC
+                 +--------+--------+--------+
+                 |                 |        |
+                 v                 v        v
+          Scanner A process  Scanner B process  Scanner C process
+          stdio + store      socket + store     gRPC + store
 ```
 
 Core is vendor-agnostic. Scanner-specific matching logic and signature state
@@ -52,10 +57,11 @@ within the standard library without conflating it with Scanner Protocol v1.
 
 FR-01 implements Core liveness/status and graceful shutdown on this transport.
 The `serve` configuration is strict JSON with positive `startupTimeoutMs` and
-`scanTimeoutMs` values and a non-empty `workers` array. Each worker defines a
-unique `scannerId`, `workerVersion`, executable path, signature path, and
-optional fault-injection settings. Relative paths resolve from the directory
-containing the configuration file. Unknown fields, duplicate worker IDs, and
+`scanTimeoutMs` values and exactly three required worker slots: `stdioWorker`,
+`socketWorker`, and `grpcWorker`. Each slot defines a unique `scannerId`,
+`workerVersion`, executable path, signature path, and optional fault-injection
+settings. Relative paths resolve from the directory containing the
+configuration file. Unknown fields, duplicate worker IDs, missing slots, and
 non-regular executable or signature paths are rejected before Core listens.
 
 ### Coordinator
@@ -69,32 +75,37 @@ and mutates:
 - in-flight requests and their expected results;
 - timeout, crash, reload, and update transitions.
 
-CLI handlers, timers, pipe readers, pipe writers, and process waiters communicate
+CLI handlers, timers, transport readers, transport writers, and process waiters communicate
 with the coordinator through typed channels. They do not mutate coordinator
 maps or worker state directly.
 
 ### Process manager
 
-`pkg/process` starts each scanner with `os/exec`, connects its standard streams,
+`pkg/process` starts each scanner with `os/exec`, exposes its standard streams,
 and observes `cmd.Wait` in a dedicated goroutine. A worker exit becomes a
 coordinator event; it does not terminate Core or another worker.
 
 ### IPC and protocol
 
 `pkg/protocol` owns Scanner Protocol v1 message definitions and validation.
-`pkg/ipc` owns bounded newline-delimited JSON framing.
+`pkg/ipc` owns bounded newline-delimited JSON framing. `pkg/workertransport`
+owns the Core-side transport connection.
 
-Each Core-to-Worker or Worker-to-Core message is one JSON object terminated by
-`\n`. Worker stdout is reserved for protocol frames. Human-readable and
-structured diagnostics go to stderr through `log/slog` so they cannot corrupt
-the protocol stream.
+The topology fixes one transport per worker slot. `stdioWorker` uses NDJSON
+over child standard streams. `socketWorker` uses the same bounded NDJSON frames
+over a loopback TCP connection. `grpcWorker` uses the generated
+`miniav.scanner.v1.Scanner/Exchange` bidirectional service with Protocol
+Buffers messages defined in `api/scanner/v1/scanner.proto`. Socket and gRPC
+workers bind an ephemeral loopback port and announce it to Core with one
+bootstrap frame on stdout. Human-readable and structured diagnostics always go
+to stderr through `log/slog`.
 
 `pkg/worker` implements the shared Scanner Protocol v1 runtime used by
-`cmd/scanner-a` and `cmd/scanner-b`. Each command supplies its scanner identity,
-while flags provide the worker version, initial signature database, and the
-documented fault-injection behavior. The worker accepts only Core-to-Worker
-message types, handles scans concurrently, serializes protocol responses, and
-waits for in-flight scans before acknowledging shutdown.
+`cmd/scanner-a`, `cmd/scanner-b`, and `cmd/scanner-c`. Each command fixes its
+scanner identity and transport, while flags provide the worker version, initial
+signature database, and documented fault-injection behavior. The worker accepts
+only Core-to-Worker message types, handles scans concurrently, serializes
+protocol responses, and waits for in-flight scans before acknowledging shutdown.
 
 ### Signature engine
 
@@ -119,10 +130,15 @@ Aggregation is a pure policy and does not own process or coordinator state.
 
 ### Update manager
 
-`pkg/update` reads local manifests, validates required metadata and SHA-256,
-and stages candidate artifacts. It never changes active routing by itself;
-activation is a coordinator state transition after the candidate has passed
-startup, protocol handshake, and health checks.
+`pkg/update` reads manifests from either the local filesystem or a loopback
+HTTP(S) URL, validates required metadata and SHA-256, and stages candidate
+artifacts. Remote manifest artifacts are resolved relative to the manifest URL
+and must remain on the same origin. Remote requests do not follow redirects;
+manifest and artifact bodies are bounded to 64 KiB and 128 MiB respectively.
+Downloads stream through SHA-256 verification into a temporary staging file
+and are atomically published only after validation. The package never changes
+active routing by itself; activation is a coordinator state transition after
+the candidate has passed startup, protocol handshake, and health checks.
 
 Relative manifest and artifact paths resolve from the directory containing the
 Core configuration file; absolute paths remain absolute. Validated artifacts
@@ -130,6 +146,20 @@ are published immutably beneath
 `staging/<scanner-id>/<worker-version>/<artifact-name>` in that directory.
 Other runtime path-bearing features must use the same base when they are wired
 into Core.
+
+### Local update server
+
+`update-server/compose.yaml` runs a single nginx container. Its port is
+published only as `127.0.0.1:8080`, and a read-only bind mount exposes generated
+release files beneath `/releases/`. nginx permits only `GET` and `HEAD`, disables
+directory listing, and provides no upload or mutation API.
+
+`update-server/publish.ps1` is the deliberately small vendor integration
+pipeline for the demo: it builds a selected worker, places the artifact in a
+versioned release directory, calculates SHA-256, and writes the release
+manifest. There is no adapter service, signing service, CDN, TLS termination,
+or metadata signature. This is a local distribution fixture, not a production
+update service.
 
 ## Worker lifecycle
 
@@ -152,7 +182,7 @@ STARTING -> HEALTHY -> ACTIVE -> DRAINING -> RETIRED
 ### Scan
 
 1. Core validates that the target is a regular file.
-2. The coordinator allocates a request ID and records the active worker set.
+2. The coordinator allocates a request ID and records the three active workers.
 3. IPC writers send the scan request without blocking the event loop.
 4. Reader goroutines turn worker responses into coordinator events.
 5. The coordinator collects all expected results or substitutes terminal
@@ -168,14 +198,15 @@ STARTING -> HEALTHY -> ACTIVE -> DRAINING -> RETIRED
 
 ### Blue/green update
 
-1. Validate the manifest and candidate artifact hash.
-2. Start the candidate without changing active routing.
-3. Complete protocol handshake and health checks.
-4. Make the candidate active and mark the previous worker draining as one
+1. Read a local manifest or download a loopback manifest and its artifact.
+2. Validate the manifest and candidate artifact hash, then publish staging.
+3. Start the candidate without changing active routing.
+4. Complete protocol handshake and health checks.
+5. Make the candidate active and mark the previous worker draining as one
    coordinator transition.
-5. Route new scans to the candidate while old requests finish on the previous
+6. Route new scans to the candidate while old requests finish on the previous
    worker.
-6. Shut down and retire the old worker after its in-flight count reaches zero.
+7. Shut down and retire the old worker after its in-flight count reaches zero.
 
 Any failure before activation marks only the candidate failed and leaves the
 previous worker active. After activation, an unexpected candidate exit follows
@@ -185,8 +216,9 @@ cutover.
 
 ## Concurrency and shutdown rules
 
-- The coordinator must never block on pipe I/O, process waits, filesystem
+- The coordinator must never block on transport I/O, process waits, filesystem
   scans, or timer sleeps.
+- Transport reader and writer goroutines never mutate coordinator state.
 - Channel producers own sending; the component that creates a channel owns
   closing it. Receivers do not close shared event channels.
 - Every operation that can wait accepts a `context.Context` or has a bounded
@@ -197,8 +229,12 @@ cutover.
 
 ## Security and portability boundaries
 
-- Use Go 1.22 or newer and the standard library only.
+- Use Go 1.22 or newer. The only direct third-party dependency is
+  `google.golang.org/grpc`.
 - Bind any local network control endpoint to loopback, never all interfaces.
+- Bind worker Socket and gRPC endpoints to loopback with ephemeral ports.
+- Accept remote update sources only when the URL host is a literal loopback IP;
+  reject redirects and cross-origin artifact references.
 - Treat file paths and protocol data as untrusted input.
 - Never execute scanned files or obtain real malware for tests.
 - Prefer portable APIs; isolate unavoidable operating-system behavior in small

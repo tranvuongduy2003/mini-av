@@ -10,18 +10,23 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"miniav/pkg/workertransport"
 )
 
 type Config struct {
-	StartupTimeoutMs int      `json:"startupTimeoutMs"`
-	ScanTimeoutMs    int      `json:"scanTimeoutMs"`
-	Workers          []Worker `json:"workers"`
-	BaseDir          string   `json:"-"`
+	StartupTimeoutMs int    `json:"startupTimeoutMs"`
+	ScanTimeoutMs    int    `json:"scanTimeoutMs"`
+	StdioWorker      Worker `json:"stdioWorker"`
+	SocketWorker     Worker `json:"socketWorker"`
+	GRPCWorker       Worker `json:"grpcWorker"`
+	BaseDir          string `json:"-"`
 }
 
 type Worker struct {
 	ScannerID     string `json:"scannerId"`
 	WorkerVersion string `json:"workerVersion"`
+	Transport     string `json:"-"`
 	Executable    string `json:"executable"`
 	SignaturePath string `json:"signaturePath"`
 	DelayMs       int    `json:"delayMs,omitempty"`
@@ -73,6 +78,10 @@ func (config Config) ScanTimeout() time.Duration {
 	return time.Duration(config.ScanTimeoutMs) * time.Millisecond
 }
 
+func (config Config) Workers() []Worker {
+	return []Worker{config.StdioWorker, config.SocketWorker, config.GRPCWorker}
+}
+
 func (config *Config) validate() error {
 	if config.StartupTimeoutMs <= 0 {
 		return errors.New("startupTimeoutMs must be greater than zero")
@@ -80,33 +89,40 @@ func (config *Config) validate() error {
 	if config.ScanTimeoutMs <= 0 {
 		return errors.New("scanTimeoutMs must be greater than zero")
 	}
-	if len(config.Workers) == 0 {
-		return errors.New("workers must contain at least one worker")
+	workers := []struct {
+		name      string
+		transport string
+		worker    *Worker
+	}{
+		{name: "stdioWorker", transport: workertransport.Stdio, worker: &config.StdioWorker},
+		{name: "socketWorker", transport: workertransport.Socket, worker: &config.SocketWorker},
+		{name: "grpcWorker", transport: workertransport.GRPC, worker: &config.GRPCWorker},
 	}
-	seen := make(map[string]struct{}, len(config.Workers))
-	for index := range config.Workers {
-		worker := &config.Workers[index]
+	seen := make(map[string]struct{}, len(workers))
+	for _, configured := range workers {
+		worker := configured.worker
+		worker.Transport = configured.transport
 		if strings.TrimSpace(worker.ScannerID) == "" {
-			return fmt.Errorf("workers[%d].scannerId must not be empty", index)
+			return fmt.Errorf("%s.scannerId must not be empty", configured.name)
 		}
 		if _, exists := seen[worker.ScannerID]; exists {
 			return fmt.Errorf("scannerId %q is duplicated", worker.ScannerID)
 		}
 		seen[worker.ScannerID] = struct{}{}
 		if strings.TrimSpace(worker.WorkerVersion) == "" {
-			return fmt.Errorf("workers[%d].workerVersion must not be empty", index)
+			return fmt.Errorf("%s.workerVersion must not be empty", configured.name)
 		}
 		if worker.DelayMs < 0 {
-			return fmt.Errorf("workers[%d].delayMs must not be negative", index)
+			return fmt.Errorf("%s.delayMs must not be negative", configured.name)
 		}
 		var err error
 		worker.Executable, err = regularPath(config.BaseDir, worker.Executable, "executable")
 		if err != nil {
-			return fmt.Errorf("workers[%d]: %w", index, err)
+			return fmt.Errorf("%s: %w", configured.name, err)
 		}
 		worker.SignaturePath, err = regularPath(config.BaseDir, worker.SignaturePath, "signaturePath")
 		if err != nil {
-			return fmt.Errorf("workers[%d]: %w", index, err)
+			return fmt.Errorf("%s: %w", configured.name, err)
 		}
 	}
 	return nil

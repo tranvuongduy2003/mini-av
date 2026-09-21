@@ -14,7 +14,7 @@ const usage = `usage:
   miniav scan <file>
   miniav status
   miniav reload <scanner-id> <path>
-  miniav update --manifest <path>
+  miniav update --manifest <source>
   miniav shutdown
 `
 
@@ -124,7 +124,11 @@ func requiredFlag(args []string, name string, command string) (string, error) {
 		return "", fmt.Errorf("%s does not accept positional arguments", command)
 	}
 	if strings.TrimSpace(*value) == "" {
-		return "", fmt.Errorf("%s requires --%s <path>", command, name)
+		placeholder := "path"
+		if command == "update" && name == "manifest" {
+			placeholder = "source"
+		}
+		return "", fmt.Errorf("%s requires --%s <%s>", command, name, placeholder)
 	}
 	return *value, nil
 }

@@ -1,0 +1,9 @@
+services:
+  update-server:
+    image: nginx:alpine
+    container_name: miniav-update-server
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./releases:/usr/share/nginx/html/releases:ro

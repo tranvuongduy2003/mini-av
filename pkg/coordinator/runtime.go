@@ -14,9 +14,9 @@ import (
 
 	"miniav/pkg/aggregator"
 	"miniav/pkg/config"
-	"miniav/pkg/ipc"
 	processmanager "miniav/pkg/process"
 	"miniav/pkg/protocol"
+	"miniav/pkg/workertransport"
 )
 
 type ScanResult struct {
@@ -50,6 +50,8 @@ const postAckExitGrace = 250 * time.Millisecond
 type runtimeWorker struct {
 	key                  WorkerKey
 	child                *processmanager.Child
+	connection           workertransport.Connection
+	transport            string
 	outbound             chan protocol.Message
 	state                WorkerState
 	signaturePath        string
@@ -84,9 +86,10 @@ type runtimeState struct {
 }
 
 type registerRuntimeCommand struct {
-	worker config.Worker
-	child  *processmanager.Child
-	reply  chan error
+	worker     config.Worker
+	child      *processmanager.Child
+	connection workertransport.Connection
+	reply      chan error
 }
 
 type workerMessageEvent struct {
@@ -195,6 +198,9 @@ func NewRuntime(parent context.Context, startupTimeout time.Duration, scanTimeou
 
 func (runtime *Runtime) StartWorker(ctx context.Context, worker config.Worker) error {
 	args := []string{"-worker-version", worker.WorkerVersion, "-signatures", worker.SignaturePath}
+	if worker.Transport != workertransport.Stdio {
+		args = append(args, "-listen", "127.0.0.1:0")
+	}
 	if worker.DelayMs != 0 {
 		args = append(args, "-delay", fmt.Sprint(worker.DelayMs))
 	}
@@ -208,18 +214,25 @@ func (runtime *Runtime) StartWorker(ctx context.Context, worker config.Worker) e
 	if err != nil {
 		return err
 	}
+	startupCtx, cancel := context.WithTimeout(ctx, runtime.startupTimeout)
+	defer cancel()
+	connection, err := runtime.connectWorker(startupCtx, worker.Transport, child)
+	if err != nil {
+		child.Terminate()
+		return err
+	}
 	key := WorkerKey{ScannerID: worker.ScannerID, Version: worker.WorkerVersion}
 	registerReply := make(chan error, 1)
-	if err := runtime.send(ctx, registerRuntimeCommand{worker: worker, child: child, reply: registerReply}); err != nil {
+	if err := runtime.send(ctx, registerRuntimeCommand{worker: worker, child: child, connection: connection, reply: registerReply}); err != nil {
+		connection.Close()
 		child.Terminate()
 		return err
 	}
 	if err := waitRuntimeReply(ctx, runtime.done, registerReply); err != nil {
+		connection.Close()
 		child.Terminate()
 		return err
 	}
-	startupCtx, cancel := context.WithTimeout(ctx, runtime.startupTimeout)
-	defer cancel()
 	if err := runtime.hello(startupCtx, key); err != nil {
 		runtime.failCandidate(key, err)
 		return fmt.Errorf("worker %q handshake: %w", key, err)
@@ -233,6 +246,32 @@ func (runtime *Runtime) StartWorker(ctx context.Context, worker config.Worker) e
 		return err
 	}
 	return nil
+}
+
+func (runtime *Runtime) connectWorker(ctx context.Context, mode string, child *processmanager.Child) (workertransport.Connection, error) {
+	if mode == workertransport.Stdio {
+		return workertransport.NewStream(child.Stdout(), child.Stdin(), child.Stdout(), child.Stdin()), nil
+	}
+	type result struct {
+		bootstrap workertransport.Bootstrap
+		err       error
+	}
+	ready := make(chan result, 1)
+	go func() {
+		bootstrap, err := workertransport.ReadBootstrap(child.Stdout())
+		ready <- result{bootstrap: bootstrap, err: err}
+	}()
+	select {
+	case received := <-ready:
+		if received.err != nil {
+			return nil, received.err
+		}
+		return workertransport.Dial(ctx, mode, received.bootstrap.Address)
+	case exit := <-child.Exited():
+		return nil, fmt.Errorf("worker exited during %s bootstrap with code %d", mode, exit.Code)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("worker %s bootstrap: %w", mode, ctx.Err())
+	}
 }
 
 func (runtime *Runtime) Scan(ctx context.Context, path string) (ScanResult, error) {
@@ -384,6 +423,7 @@ func (runtime *Runtime) run(ctx context.Context) {
 	defer func() {
 		for _, worker := range state.workers {
 			close(worker.outbound)
+			worker.connection.Close()
 			if worker.state != WorkerRetired {
 				worker.child.Terminate()
 			}
@@ -450,7 +490,7 @@ func (runtime *Runtime) registerRuntimeWorker(state *runtimeState, command regis
 			return fmt.Errorf("scanner %q already has candidate %q", key.ScannerID, worker.key)
 		}
 	}
-	worker := &runtimeWorker{key: key, child: command.child, outbound: make(chan protocol.Message, 64), state: WorkerStarting, signaturePath: command.worker.SignaturePath}
+	worker := &runtimeWorker{key: key, child: command.child, connection: command.connection, transport: command.worker.Transport, outbound: make(chan protocol.Message, 64), state: WorkerStarting, signaturePath: command.worker.SignaturePath}
 	state.workers[key] = worker
 	runtime.logger.Info("worker registered", "worker", key.String(), "pid", command.child.PID())
 	go runtime.writeWorker(worker)
@@ -465,9 +505,8 @@ func (runtime *Runtime) registerRuntimeWorker(state *runtimeState, command regis
 }
 
 func (runtime *Runtime) writeWorker(worker *runtimeWorker) {
-	encoder := ipc.NewEncoder(worker.child.Stdin())
 	for message := range worker.outbound {
-		if err := encoder.Encode(message); err != nil {
+		if err := worker.connection.Send(message); err != nil {
 			runtime.emit(workerFailureEvent{key: worker.key, reason: fmt.Sprintf("write worker protocol: %v", err)})
 			return
 		}
@@ -475,9 +514,8 @@ func (runtime *Runtime) writeWorker(worker *runtimeWorker) {
 }
 
 func (runtime *Runtime) readWorker(worker *runtimeWorker) {
-	decoder := ipc.NewDecoder(worker.child.Stdout())
 	for {
-		message, err := decoder.Decode()
+		message, err := worker.connection.Receive()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				runtime.emit(workerFailureEvent{key: worker.key, reason: fmt.Sprintf("read worker protocol: %v", err)})
@@ -835,7 +873,7 @@ func (runtime *Runtime) allWorkersStopped(state runtimeState) bool {
 func (runtime *Runtime) runtimeSnapshot(state runtimeState) RuntimeSnapshot {
 	workers := make([]WorkerSnapshot, 0, len(state.workers))
 	for _, worker := range state.workers {
-		workers = append(workers, WorkerSnapshot{Key: worker.key, PID: worker.child.PID(), State: worker.state, FailureReason: worker.failureReason, ExitCode: worker.exitCode, ExitError: worker.exitError})
+		workers = append(workers, WorkerSnapshot{Key: worker.key, PID: worker.child.PID(), Transport: worker.transport, State: worker.state, FailureReason: worker.failureReason, ExitCode: worker.exitCode, ExitError: worker.exitError})
 	}
 	sort.Slice(workers, func(i, j int) bool { return workers[i].Key.String() < workers[j].Key.String() })
 	return RuntimeSnapshot{Workers: workers}
@@ -847,7 +885,7 @@ func (runtime *Runtime) activeWorker(state runtimeState, scannerID string) activ
 		return activeWorkerResult{err: fmt.Errorf("scanner %q has no active worker", scannerID)}
 	}
 	worker := state.workers[key]
-	return activeWorkerResult{worker: config.Worker{ScannerID: key.ScannerID, WorkerVersion: key.Version, SignaturePath: worker.signaturePath}}
+	return activeWorkerResult{worker: config.Worker{ScannerID: key.ScannerID, WorkerVersion: key.Version, Transport: worker.transport, SignaturePath: worker.signaturePath}}
 }
 
 func waitRuntimeReply(ctx context.Context, done <-chan struct{}, reply <-chan error) error {

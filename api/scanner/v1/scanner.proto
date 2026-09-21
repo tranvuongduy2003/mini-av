@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package miniav.scanner.v1;
+
+option go_package = "miniav/pkg/grpcprotocol;grpcprotocol";
+
+service Scanner {
+  rpc Exchange(stream Message) returns (stream Message);
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_CLEAN = 1;
+  VERDICT_MALWARE = 2;
+  VERDICT_ERROR = 3;
+  VERDICT_TIMEOUT = 4;
+  VERDICT_UNAVAILABLE = 5;
+}
+
+message Message {
+  int32 version = 1;
+  string type = 2;
+  uint64 request_id = 3;
+  string scanner_id = 4;
+  string worker_version = 5;
+  repeated string capabilities = 6;
+  string file_path = 7;
+  string signature_path = 8;
+  string status = 9;
+  Verdict verdict = 10;
+  string signature = 11;
+  optional int64 duration_ms = 12;
+  optional bool success = 13;
+  optional int32 signature_count = 14;
+  string error = 15;
+}

@@ -6,7 +6,7 @@ engineering in Go.**
 MiniAV coordinates independent scanner processes behind a stable Core. Scanner
 engines and signature databases can be replaced while Core stays online,
 in-flight scans finish safely, and failed candidates leave the working engine
-in place. The project explores process isolation, NDJSON IPC, actor-style
+in place. The project explores process isolation, three-transport IPC, actor-style
 concurrency, health-gated activation, graceful draining, and rollback.
 
 > [!WARNING]
@@ -17,12 +17,12 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-07 are implemented end to end. Core starts configured worker
-processes, gates activation on handshake and health checks, scans with every
-active engine, substitutes timeout and unavailable results, reloads signatures,
-and performs health-gated blue/green updates from SHA-256-verified local
-manifests. Worker crashes remain isolated and pre-activation update failures
-leave the active version in place.
+FR-01 through FR-08 are implemented end to end. Core starts the fixed stdio,
+Socket, and gRPC worker processes, gates activation on handshake and health
+checks, scans with every active engine, substitutes timeout and unavailable results, reloads signatures,
+and performs health-gated blue/green updates from SHA-256-verified local or
+loopback-hosted manifests. Worker crashes remain isolated and pre-activation
+update failures leave the active version in place.
 
 ## Hot-swap model
 
@@ -47,9 +47,9 @@ results.
 - Isolate every scanner in an independently managed child process.
 - Scan with multiple engines and combine their results deterministically.
 - Reload signatures without restarting Core or a worker.
-- Exchange newline-delimited JSON messages over standard input and output.
+- Run one stdio worker, one loopback TCP socket worker, and one gRPC worker.
 - Keep routing and lifecycle state inside a single coordinator goroutine.
-- Use only the Go standard library.
+- Keep third-party code limited to the official Go gRPC implementation.
 
 ## Architecture
 
@@ -64,12 +64,12 @@ User / CLI
 |                 process and IPC events                        |
 |                         |                                     |
 +-------------------------|-------------------------------------+
-                          | NDJSON over stdin/stdout
-                 +--------+--------+
-                 |                 |
-                 v                 v
-          Scanner A process  Scanner B process
-          signature store    signature store
+                          | stdio / TCP socket / gRPC
+                 +--------+--------+--------+
+                 |                 |        |
+                 v                 v        v
+          Scanner A process  Scanner B process  Scanner C process
+          stdio + store      socket + store     gRPC + store
 ```
 
 Core is scanner-agnostic. Each worker owns its matching logic and in-memory
@@ -87,7 +87,7 @@ miniav serve --config <path>
 miniav scan <file>
 miniav status
 miniav reload <scanner-id> <signature-path>
-miniav update --manifest <path>
+miniav update --manifest <source>
 miniav shutdown
 ```
 
@@ -97,10 +97,10 @@ miniav shutdown
 | `scan` | Scan a regular file with all active workers. |
 | `status` | Show Core and worker health and lifecycle state. |
 | `reload` | Replace one worker's in-memory signature database. |
-| `update` | Validate and activate a new worker release. |
+| `update` | Validate and activate a release from a local path or loopback URL. |
 | `shutdown` | Gracefully stop Core and reap all child processes. |
 
-Build Core and both workers, then start Core with the supplied configuration:
+Build Core and all three workers, then start Core with the supplied configuration:
 
 ```sh
 make build
@@ -127,9 +127,10 @@ sample configuration. Relative paths in configuration, scan, reload, and
 manifest commands resolve from the configuration directory.
 
 The strict JSON configuration contains positive `startupTimeoutMs` and
-`scanTimeoutMs` values plus a non-empty worker list. Workers also accept
-optional `delayMs`, `crashOnScan`, and `failHealth` fields for local fault
-injection.
+`scanTimeoutMs` values plus the required `stdioWorker`, `socketWorker`, and
+`grpcWorker` objects. Transport is fixed by the slot and cannot be selected in
+configuration. Optional `delayMs`, `crashOnScan`, and `failHealth` fields
+provide local fault injection.
 
 ## Development commands
 
@@ -149,13 +150,32 @@ make run ARGS="status"
 make run ARGS="serve --config <path>"
 ```
 
-## Scanner protocol
+## Scanner protocol and transports
 
-Core and workers use Scanner Protocol v1: one JSON object per line over
-`stdin` and `stdout`. Worker diagnostics go to `stderr` so logs cannot corrupt
-the protocol stream. Frames are limited to 64 KiB and messages with an unknown
-field, unsupported protocol version, unknown type, missing required field, or
-missing terminating newline are rejected.
+Core and workers use Scanner Protocol v1 over a fixed three-worker topology:
+
+| Worker slot | Transport |
+| --- | --- |
+| `stdioWorker` (`scanner-a`) | Bounded NDJSON over worker stdin/stdout. |
+| `socketWorker` (`scanner-b`) | Bounded NDJSON over an ephemeral loopback TCP connection. |
+| `grpcWorker` (`scanner-c`) | Generated `miniav.scanner.v1.Scanner/Exchange` bidirectional gRPC service using Protocol Buffers. |
+
+Socket and gRPC workers never expose a non-loopback listener. Worker
+diagnostics go to `stderr`; network workers use `stdout` only for the endpoint
+bootstrap frame. NDJSON frames are limited to 64 KiB, and protocol validation
+is identical for all three transports.
+
+The canonical gRPC schema is
+[`api/scanner/v1/scanner.proto`](api/scanner/v1/scanner.proto). Generated Go
+client and server stubs are checked in under `pkg/grpcprotocol`. After changing
+the schema, install `protoc-gen-go` and `protoc-gen-go-grpc`, then run:
+
+```sh
+make generate
+```
+
+The following JSON frames apply to the stdio and Socket transports. The gRPC
+worker carries the equivalent typed fields in protobuf messages.
 
 Example request:
 
@@ -210,8 +230,8 @@ reports the published signature count.
 
 ## Worker releases
 
-Worker releases are described by local JSON manifests containing the scanner
-ID, worker version, signature version, artifact path, and SHA-256 digest.
+Worker releases are described by JSON manifests containing the scanner ID,
+worker version, signature version, artifact path, and SHA-256 digest.
 Relative manifest and artifact paths resolve from the directory containing the
 Core configuration file; absolute paths remain absolute. A validated artifact
 is published beneath
@@ -227,6 +247,25 @@ After activation, the old version drains its assigned requests before
 retirement. An unexpected exit after activation follows normal failure
 isolation and does not reactivate an already draining generation.
 
+## Local update server
+
+The optional update server is a single nginx container bound only to
+`127.0.0.1:8080`. It serves generated release files read-only and has no upload,
+adapter, signing, CDN, or Internet-facing component.
+
+Publish a worker release, start nginx, and update the running Core:
+
+```powershell
+.\update-server\publish.ps1 -ScannerId scanner-a -WorkerVersion 2.0.0
+docker compose -f update-server/compose.yaml up -d
+.\miniav.exe update --manifest http://127.0.0.1:8080/releases/scanner-a/2.0.0/manifest.json
+```
+
+Remote manifests may use only a relative `artifactPath`. MiniAV accepts remote
+sources only on literal loopback IPs, rejects redirects and cross-origin
+artifacts, bounds download sizes, and verifies SHA-256 while streaming into
+temporary staging. The existing local-manifest workflow remains supported.
+
 ## Local demonstration
 
 Run the complete scenario from PowerShell:
@@ -235,7 +274,7 @@ Run the complete scenario from PowerShell:
 .\demo.ps1
 ```
 
-The script builds all binaries, starts two workers, demonstrates clean and
+The script builds all binaries, starts three workers, demonstrates clean and
 malicious aggregation, reloads Scanner A, performs an in-flight v1-to-v2
 cutover, rejects a broken v3 artifact while retaining v2, verifies the stable
 Core PID, and shuts the system down.
@@ -244,7 +283,9 @@ Core PID, and shuts the system down.
 
 - Go 1.22 or newer
 - Windows x64, Linux, or macOS
-- No third-party Go modules or native toolchain dependencies
+- `google.golang.org/grpc` and its Go module dependencies
+- No native toolchain dependencies
+- `protoc`, `protoc-gen-go`, and `protoc-gen-go-grpc` only when regenerating stubs
 
 The standard verification commands are:
 
@@ -259,16 +300,18 @@ go test -race ./...
 
 - [x] Standalone scanner
 - [x] Signature database, streaming matching, and atomic reload
-- [x] Scanner Protocol v1 over standard streams
+- [x] Scanner Protocol v1 over fixed stdio, Socket, and gRPC workers
 - [x] Child-process supervision and crash isolation
 - [x] Coordinator state tracking and result aggregation policy
 - [x] Manifest validation, immutable staging, and pre-activation rollback state
 - [x] Worker runtime and multi-worker scan routing
 - [x] Blue/green worker updates and rollback
+- [x] Loopback-only Docker/nginx release server and remote staging
 - [x] End-to-end local demonstration
 
 ## Non-goals
 
 MiniAV intentionally excludes real-time protection, kernel or driver work,
 memory and network scanning, archive extraction, a graphical interface,
-Internet-hosted updates, and production security guarantees.
+Internet-hosted updates, PKI or signed metadata, and production security
+guarantees.

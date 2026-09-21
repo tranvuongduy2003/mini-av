@@ -7,4 +7,5 @@
 *.test
 /miniav
 /releases/**/staging/
+/update-server/releases/
 AGENTS.md

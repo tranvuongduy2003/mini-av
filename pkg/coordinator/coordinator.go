@@ -35,6 +35,7 @@ func (key WorkerKey) String() string {
 type WorkerSnapshot struct {
 	Key           WorkerKey
 	PID           int
+	Transport     string
 	State         WorkerState
 	FailureReason string
 	ExitCode      int

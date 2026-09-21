@@ -82,7 +82,7 @@ func serve(ctx context.Context, address string, configPath string) error {
 	if err != nil {
 		return err
 	}
-	for _, worker := range loaded.Workers {
+	for _, worker := range loaded.Workers() {
 		if err := runtime.StartWorker(ctx, worker); err != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), loaded.StartupTimeout())
 			runtime.Shutdown(shutdownCtx)
@@ -206,7 +206,7 @@ func dispatchCommand(ctx context.Context, request commandRequest, runtime *coord
 		}
 		lines := []string{"core: running", fmt.Sprintf("workers: %d", len(snapshot.Workers))}
 		for _, worker := range snapshot.Workers {
-			line := fmt.Sprintf("%s pid=%d state=%s", worker.Key, worker.PID, worker.State)
+			line := fmt.Sprintf("%s pid=%d transport=%s state=%s", worker.Key, worker.PID, worker.Transport, worker.State)
 			if worker.FailureReason != "" {
 				line += " reason=" + worker.FailureReason
 			}
@@ -253,7 +253,7 @@ func dispatchCommand(ctx context.Context, request commandRequest, runtime *coord
 		if err != nil {
 			return commandResponse{Error: err.Error()}
 		}
-		candidate := config.Worker{ScannerID: prepared.Manifest.ScannerID, WorkerVersion: prepared.Manifest.WorkerVersion, Executable: prepared.StagedPath, SignaturePath: active.SignaturePath}
+		candidate := config.Worker{ScannerID: prepared.Manifest.ScannerID, WorkerVersion: prepared.Manifest.WorkerVersion, Transport: active.Transport, Executable: prepared.StagedPath, SignaturePath: active.SignaturePath}
 		if err := runtime.StartWorker(ctx, candidate); err != nil {
 			return commandResponse{Error: fmt.Sprintf("update rolled back: %v", err)}
 		}

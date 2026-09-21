@@ -23,6 +23,7 @@ const coreAddress = "127.0.0.1:7331"
 var miniavBinary string
 var scannerABinary string
 var scannerBBinary string
+var scannerCBinary string
 
 func TestMain(m *testing.M) {
 	if os.Getenv(processHelperEnvironment) != "" || os.Getenv(coordinatorHelperEnvironment) != "" {
@@ -48,6 +49,7 @@ func TestMain(m *testing.M) {
 		{name: "miniav", path: "./cmd/miniav", set: func(path string) { miniavBinary = path }},
 		{name: "scanner-a", path: "./cmd/scanner-a", set: func(path string) { scannerABinary = path }},
 		{name: "scanner-b", path: "./cmd/scanner-b", set: func(path string) { scannerBBinary = path }},
+		{name: "scanner-c", path: "./cmd/scanner-c", set: func(path string) { scannerCBinary = path }},
 	} {
 		binaryName := target.name
 		if runtime.GOOS == "windows" {
@@ -64,13 +66,24 @@ func TestMain(m *testing.M) {
 	}
 
 	exitCode := m.Run()
-	if err := os.RemoveAll(temporaryDirectory); err != nil {
+	if err := removeTestDirectory(temporaryDirectory); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		if exitCode == 0 {
 			exitCode = 1
 		}
 	}
 	os.Exit(exitCode)
+}
+
+func removeTestDirectory(path string) error {
+	deadline := time.Now().Add(3 * time.Second)
+	var err error
+	for {
+		if err = os.RemoveAll(path); err == nil || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func TestCLIRejectsInvalidCommands(t *testing.T) {
@@ -88,7 +101,7 @@ func TestCLIRejectsInvalidCommands(t *testing.T) {
 		{name: "status arguments", args: []string{"status", "extra"}, want: "status does not accept arguments"},
 		{name: "reload count", args: []string{"reload", "scanner-a"}, want: "reload requires a scanner ID and signature path"},
 		{name: "reload empty", args: []string{"reload", " ", "signatures.txt"}, want: "reload requires a non-empty scanner ID and signature path"},
-		{name: "missing manifest", args: []string{"update"}, want: "update requires --manifest <path>"},
+		{name: "missing manifest", args: []string{"update"}, want: "update requires --manifest <source>"},
 		{name: "shutdown arguments", args: []string{"shutdown", "extra"}, want: "shutdown does not accept arguments"},
 	}
 
@@ -112,7 +125,7 @@ func TestServeStatusCommandsAndShutdown(t *testing.T) {
 	core := startCore(t)
 
 	status := runMiniav(t, 2*time.Second, "status")
-	if status.exitCode != 0 || !strings.Contains(status.stdout, "core: running\nworkers: 2\n") || !strings.Contains(status.stdout, "scanner-a@1.0.0") || !strings.Contains(status.stdout, "state=ACTIVE") || status.stderr != "" {
+	if status.exitCode != 0 || !strings.Contains(status.stdout, "core: running\nworkers: 3\n") || !strings.Contains(status.stdout, "scanner-a@1.0.0") || !strings.Contains(status.stdout, "state=ACTIVE") || status.stderr != "" {
 		t.Fatalf("status result = %#v", status)
 	}
 
@@ -123,12 +136,30 @@ func TestServeStatusCommandsAndShutdown(t *testing.T) {
 	core.wait(t)
 }
 
+func TestFixedWorkerTransportTopology(t *testing.T) {
+	startCore(t)
+	status := runMiniav(t, 2*time.Second, "status")
+	wanted := map[string]string{"scanner-a@1.0.0": "stdio", "scanner-b@1.0.0": "socket", "scanner-c@1.0.0": "grpc"}
+	for worker, transport := range wanted {
+		found := false
+		for _, line := range strings.Split(status.stdout, "\n") {
+			if strings.HasPrefix(line, worker+" ") && strings.Contains(line, "transport="+transport+" state=ACTIVE") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("status = %q, want active %s over %s", status.stdout, worker, transport)
+		}
+	}
+}
+
 func TestScanAggregationAndReloadEndToEnd(t *testing.T) {
 	core := startCore(t)
 	cleanPath := filepath.Join(core.base, "clean.txt")
 	writeTestFile(t, cleanPath, []byte("nothing suspicious"), 0o600)
 	clean := runMiniav(t, 2*time.Second, "scan", cleanPath)
-	if clean.exitCode != 0 || !strings.Contains(clean.stdout, "verdict: CLEAN") || !strings.Contains(clean.stdout, "scanner-a@1.0.0: CLEAN") || !strings.Contains(clean.stdout, "scanner-b@1.0.0: CLEAN") {
+	if clean.exitCode != 0 || !strings.Contains(clean.stdout, "verdict: CLEAN") || !strings.Contains(clean.stdout, "scanner-a@1.0.0: CLEAN") || !strings.Contains(clean.stdout, "scanner-b@1.0.0: CLEAN") || !strings.Contains(clean.stdout, "scanner-c@1.0.0: CLEAN") {
 		t.Fatalf("clean scan = %#v", clean)
 	}
 
@@ -154,8 +185,8 @@ func TestScanAggregationAndReloadEndToEnd(t *testing.T) {
 
 func TestScanTimeoutAndWorkerCrashAreIsolated(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
-		core := startCoreConfigured(t, 50, func(workers []map[string]any) {
-			workers[1]["delayMs"] = 250
+		core := startCoreConfigured(t, 50, func(workers map[string]map[string]any) {
+			workers["socketWorker"]["delayMs"] = 250
 		})
 		path := filepath.Join(core.base, "clean.txt")
 		writeTestFile(t, path, []byte("clean"), 0o600)
@@ -170,25 +201,25 @@ func TestScanTimeoutAndWorkerCrashAreIsolated(t *testing.T) {
 	})
 
 	t.Run("crash", func(t *testing.T) {
-		core := startCoreConfigured(t, 500, func(workers []map[string]any) {
-			workers[1]["crashOnScan"] = true
+		core := startCoreConfigured(t, 500, func(workers map[string]map[string]any) {
+			workers["grpcWorker"]["crashOnScan"] = true
 		})
 		path := filepath.Join(core.base, "clean.txt")
 		writeTestFile(t, path, []byte("clean"), 0o600)
 		result := runMiniav(t, 2*time.Second, "scan", path)
-		if result.exitCode != 0 || !strings.Contains(result.stdout, "verdict: INCONCLUSIVE") || !strings.Contains(result.stdout, "scanner-b@1.0.0: UNAVAILABLE") {
+		if result.exitCode != 0 || !strings.Contains(result.stdout, "verdict: INCONCLUSIVE") || !strings.Contains(result.stdout, "scanner-c@1.0.0: UNAVAILABLE") {
 			t.Fatalf("crash scan = %#v", result)
 		}
 		status := runMiniav(t, 2*time.Second, "status")
-		if status.exitCode != 0 || !strings.Contains(status.stdout, "scanner-b@1.0.0") || !strings.Contains(status.stdout, "state=FAILED") || !strings.Contains(status.stdout, "scanner-a@1.0.0") {
+		if status.exitCode != 0 || !strings.Contains(status.stdout, "scanner-c@1.0.0") || !strings.Contains(status.stdout, "state=FAILED") || !strings.Contains(status.stdout, "scanner-a@1.0.0") {
 			t.Fatalf("status after crash = %#v", status)
 		}
 	})
 }
 
 func TestBlueGreenUpdateAndRollbackEndToEnd(t *testing.T) {
-	core := startCoreConfigured(t, 1000, func(workers []map[string]any) {
-		workers[0]["delayMs"] = 300
+	core := startCoreConfigured(t, 1000, func(workers map[string]map[string]any) {
+		workers["stdioWorker"]["delayMs"] = 300
 	})
 	manifestV2 := writeReleaseManifest(t, core.base, "2.0.0", scannerABinary)
 	scanPath := filepath.Join(core.base, "in-flight.txt")
@@ -336,21 +367,26 @@ func startCore(t *testing.T) *coreProcess {
 	return startCoreConfigured(t, 500, nil)
 }
 
-func startCoreConfigured(t *testing.T, scanTimeoutMs int, modify func([]map[string]any)) *coreProcess {
+func startCoreConfigured(t *testing.T, scanTimeoutMs int, modify func(map[string]map[string]any)) *coreProcess {
 	t.Helper()
 	base := t.TempDir()
 	signatureA := filepath.Join(base, "scanner-a.txt")
 	signatureB := filepath.Join(base, "scanner-b.txt")
+	signatureC := filepath.Join(base, "scanner-c.txt")
 	if err := os.WriteFile(signatureA, []byte("pattern-a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(signatureB, []byte("pattern-b\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(signatureC, []byte("pattern-c\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	configPath := filepath.Join(base, "miniav.json")
-	workers := []map[string]any{
-		{"scannerId": "scanner-a", "workerVersion": "1.0.0", "executable": scannerABinary, "signaturePath": signatureA},
-		{"scannerId": "scanner-b", "workerVersion": "1.0.0", "executable": scannerBBinary, "signaturePath": signatureB},
+	workers := map[string]map[string]any{
+		"stdioWorker":  {"scannerId": "scanner-a", "workerVersion": "1.0.0", "executable": scannerABinary, "signaturePath": signatureA},
+		"socketWorker": {"scannerId": "scanner-b", "workerVersion": "1.0.0", "executable": scannerBBinary, "signaturePath": signatureB},
+		"grpcWorker":   {"scannerId": "scanner-c", "workerVersion": "1.0.0", "executable": scannerCBinary, "signaturePath": signatureC},
 	}
 	if modify != nil {
 		modify(workers)
@@ -358,7 +394,9 @@ func startCoreConfigured(t *testing.T, scanTimeoutMs int, modify func([]map[stri
 	configData, err := json.Marshal(map[string]any{
 		"startupTimeoutMs": 2000,
 		"scanTimeoutMs":    scanTimeoutMs,
-		"workers":          workers,
+		"stdioWorker":      workers["stdioWorker"],
+		"socketWorker":     workers["socketWorker"],
+		"grpcWorker":       workers["grpcWorker"],
 	})
 	if err != nil {
 		t.Fatal(err)
