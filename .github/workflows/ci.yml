@@ -35,16 +35,30 @@ jobs:
             exit 1
           }
 
-      - name: Verify standard-library-only module
+      - name: Verify allowed direct dependencies
         shell: pwsh
         run: |
-          $external = go list -m -f '{{if not .Main}}{{.Path}}{{end}}' all
+          $allowed = @(
+            "google.golang.org/grpc"
+            "google.golang.org/protobuf"
+          )
+          $direct = @(
+            go list -m -f '{{if and (not .Main) (not .Indirect)}}{{.Path}}{{end}}' all |
+              Where-Object { $_ }
+          )
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          if ($external) {
-            Write-Output "External Go modules are not allowed:"
-            Write-Output $external
+          $unexpected = @($direct | Where-Object { $_ -notin $allowed })
+          $missing = @($allowed | Where-Object { $_ -notin $direct })
+          if ($unexpected) {
+            Write-Output "Unexpected direct Go modules:"
+            Write-Output $unexpected
+            exit 1
+          }
+          if ($missing) {
+            Write-Output "Required direct Go modules are missing:"
+            Write-Output $missing
             exit 1
           }
 

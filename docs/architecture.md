@@ -229,8 +229,8 @@ cutover.
 
 ## Security and portability boundaries
 
-- Use Go 1.22 or newer. The only direct third-party dependency is
-  `google.golang.org/grpc`.
+- Use Go 1.22 or newer. The only direct third-party dependencies are
+  `google.golang.org/grpc` and `google.golang.org/protobuf`.
 - Bind any local network control endpoint to loopback, never all interfaces.
 - Bind worker Socket and gRPC endpoints to loopback with ephemeral ports.
 - Accept remote update sources only when the URL host is a literal loopback IP;
