@@ -10,9 +10,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"miniav/pkg/config"
+	"miniav/pkg/coordinator"
+	updatemanager "miniav/pkg/update"
 )
 
 const (
@@ -65,29 +71,34 @@ func sendCommand(ctx context.Context, address string, request commandRequest) (c
 }
 
 func serve(ctx context.Context, address string, configPath string) error {
-	if err := validateConfigPath(configPath); err != nil {
-		return err
-	}
 	if err := validateLoopbackAddress(address); err != nil {
 		return err
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	runtime, err := coordinator.NewRuntime(ctx, loaded.StartupTimeout(), loaded.ScanTimeout(), os.Stderr)
+	if err != nil {
+		return err
+	}
+	for _, worker := range loaded.Workers {
+		if err := runtime.StartWorker(ctx, worker); err != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), loaded.StartupTimeout())
+			runtime.Shutdown(shutdownCtx)
+			cancel()
+			return fmt.Errorf("start configured worker %q: %w", worker.ScannerID, err)
+		}
 	}
 
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), loaded.StartupTimeout())
+		runtime.Shutdown(shutdownCtx)
+		cancel()
 		return fmt.Errorf("listen on %s: %w", address, err)
 	}
-	return serveListener(ctx, listener)
-}
-
-func validateConfigPath(configPath string) error {
-	info, err := os.Stat(configPath)
-	if err != nil {
-		return fmt.Errorf("read config %q: %w", configPath, err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("config %q is not a regular file", configPath)
-	}
-	return nil
+	return serveListener(ctx, listener, runtime, loaded.BaseDir, loaded.StartupTimeout())
 }
 
 func validateLoopbackAddress(address string) error {
@@ -102,7 +113,7 @@ func validateLoopbackAddress(address string) error {
 	return nil
 }
 
-func serveListener(ctx context.Context, listener net.Listener) error {
+func serveListener(ctx context.Context, listener net.Listener, runtime *coordinator.Runtime, configDir string, shutdownTimeout time.Duration) error {
 	stop := make(chan struct{})
 	var stopOnce sync.Once
 	stopListening := func() {
@@ -121,7 +132,16 @@ func serveListener(ctx context.Context, listener net.Listener) error {
 	}()
 
 	var connections sync.WaitGroup
-	defer connections.Wait()
+	defer func() {
+		connections.Wait()
+		select {
+		case <-runtime.Done():
+		default:
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			runtime.Shutdown(shutdownCtx)
+			cancel()
+		}
+	}()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -135,12 +155,12 @@ func serveListener(ctx context.Context, listener net.Listener) error {
 		connections.Add(1)
 		go func() {
 			defer connections.Done()
-			handleConnection(connection, stopListening)
+			handleConnection(connection, stopListening, runtime, configDir)
 		}()
 	}
 }
 
-func handleConnection(connection net.Conn, stopListening func()) {
+func handleConnection(connection net.Conn, stopListening func(), runtime *coordinator.Runtime, configDir string) {
 	defer connection.Close()
 	connection.SetDeadline(time.Now().Add(requestTimeout))
 
@@ -158,7 +178,9 @@ func handleConnection(connection net.Conn, stopListening func()) {
 		return
 	}
 
-	response := dispatchCommand(request)
+	requestCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	response := dispatchCommand(requestCtx, request, runtime, configDir)
 	if err := writeResponse(connection, response); err != nil {
 		return
 	}
@@ -171,21 +193,81 @@ func writeResponse(writer io.Writer, response commandResponse) error {
 	return json.NewEncoder(writer).Encode(response)
 }
 
-func dispatchCommand(request commandRequest) commandResponse {
+func dispatchCommand(ctx context.Context, request commandRequest, runtime *coordinator.Runtime, configDir string) commandResponse {
 	if err := validateCommandRequest(request); err != nil {
 		return commandResponse{Error: err.Error()}
 	}
 
 	switch request.Command {
 	case "status":
-		return commandResponse{Success: true, Output: "core: running\nworkers: 0"}
+		snapshot, err := runtime.Snapshot(ctx)
+		if err != nil {
+			return commandResponse{Error: err.Error()}
+		}
+		lines := []string{"core: running", fmt.Sprintf("workers: %d", len(snapshot.Workers))}
+		for _, worker := range snapshot.Workers {
+			line := fmt.Sprintf("%s pid=%d state=%s", worker.Key, worker.PID, worker.State)
+			if worker.FailureReason != "" {
+				line += " reason=" + worker.FailureReason
+			}
+			lines = append(lines, line)
+		}
+		return commandResponse{Success: true, Output: strings.Join(lines, "\n")}
 	case "shutdown":
+		if err := runtime.Shutdown(ctx); err != nil {
+			return commandResponse{Error: err.Error()}
+		}
 		return commandResponse{Success: true, Output: "core: stopped", Shutdown: true}
-	case "scan", "reload", "update":
-		return commandResponse{Error: fmt.Sprintf("%s is not available until its runtime requirement is implemented", request.Command)}
+	case "scan":
+		result, err := runtime.Scan(ctx, resolveControlPath(configDir, request.Args[0]))
+		if err != nil {
+			return commandResponse{Error: err.Error()}
+		}
+		keys := make([]coordinator.WorkerKey, 0, len(result.Results))
+		for key := range result.Results {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+		lines := []string{fmt.Sprintf("verdict: %s", result.Verdict), fmt.Sprintf("request_id: %d", result.RequestID)}
+		for _, key := range keys {
+			workerResult := result.Results[key]
+			line := fmt.Sprintf("%s: %s", key, workerResult.Verdict)
+			if workerResult.Signature != "" {
+				line += " signature=" + workerResult.Signature
+			}
+			lines = append(lines, line)
+		}
+		return commandResponse{Success: true, Output: strings.Join(lines, "\n")}
+	case "reload":
+		result, err := runtime.Reload(ctx, request.Args[0], resolveControlPath(configDir, request.Args[1]))
+		if err != nil {
+			return commandResponse{Error: err.Error()}
+		}
+		return commandResponse{Success: true, Output: fmt.Sprintf("reloaded %s@%s signatures=%d", result.ScannerID, result.WorkerVersion, result.SignatureCount)}
+	case "update":
+		prepared, err := updatemanager.Prepare(ctx, configDir, request.Args[0])
+		if err != nil {
+			return commandResponse{Error: err.Error()}
+		}
+		active, err := runtime.ActiveWorker(ctx, prepared.Manifest.ScannerID)
+		if err != nil {
+			return commandResponse{Error: err.Error()}
+		}
+		candidate := config.Worker{ScannerID: prepared.Manifest.ScannerID, WorkerVersion: prepared.Manifest.WorkerVersion, Executable: prepared.StagedPath, SignaturePath: active.SignaturePath}
+		if err := runtime.StartWorker(ctx, candidate); err != nil {
+			return commandResponse{Error: fmt.Sprintf("update rolled back: %v", err)}
+		}
+		return commandResponse{Success: true, Output: fmt.Sprintf("updated %s from %s to %s", candidate.ScannerID, active.WorkerVersion, candidate.WorkerVersion)}
 	default:
 		return commandResponse{Error: fmt.Sprintf("unknown command %q", request.Command)}
 	}
+}
+
+func resolveControlPath(base string, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(base, path)
 }
 
 func validateCommandRequest(request commandRequest) error {

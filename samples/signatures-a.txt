@@ -1,0 +1,2 @@
+# Scanner A initial signatures
+SCANNER_A_INITIAL_ONLY

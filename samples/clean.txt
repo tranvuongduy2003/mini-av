@@ -1,0 +1,1 @@
+This local sample contains no configured MiniAV signature.

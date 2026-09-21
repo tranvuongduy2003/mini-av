@@ -1,0 +1,1 @@
+This harmless local sample contains MINIAV_DEMO_PATTERN for testing.

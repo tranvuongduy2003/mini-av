@@ -1,0 +1,2 @@
+# Scanner A reloaded signatures
+MINIAV_DEMO_PATTERN

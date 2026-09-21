@@ -1,0 +1,18 @@
+{
+  "startupTimeoutMs": 3000,
+  "scanTimeoutMs": 1000,
+  "workers": [
+    {
+      "scannerId": "scanner-a",
+      "workerVersion": "1.0.0",
+      "executable": "../bin/scanner-a.exe",
+      "signaturePath": "../samples/signatures-a.txt"
+    },
+    {
+      "scannerId": "scanner-b",
+      "workerVersion": "1.0.0",
+      "executable": "../bin/scanner-b.exe",
+      "signaturePath": "../samples/signatures-b.txt"
+    }
+  ]
+}

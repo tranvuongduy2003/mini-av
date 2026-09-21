@@ -3,6 +3,8 @@ package tests
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,8 @@ import (
 const coreAddress = "127.0.0.1:7331"
 
 var miniavBinary string
+var scannerABinary string
+var scannerBBinary string
 
 func TestMain(m *testing.M) {
 	if os.Getenv(processHelperEnvironment) != "" || os.Getenv(coordinatorHelperEnvironment) != "" {
@@ -36,16 +40,27 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	binaryName := "miniav"
-	if runtime.GOOS == "windows" {
-		binaryName += ".exe"
-	}
-	miniavBinary = filepath.Join(temporaryDirectory, binaryName)
-	build := exec.Command("go", "build", "-race", "-o", miniavBinary, "./cmd/miniav")
-	build.Dir = repositoryRoot
-	if output, err := build.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "build miniav: %v\n%s", err, output)
-		os.Exit(1)
+	for _, target := range []struct {
+		name string
+		path string
+		set  func(string)
+	}{
+		{name: "miniav", path: "./cmd/miniav", set: func(path string) { miniavBinary = path }},
+		{name: "scanner-a", path: "./cmd/scanner-a", set: func(path string) { scannerABinary = path }},
+		{name: "scanner-b", path: "./cmd/scanner-b", set: func(path string) { scannerBBinary = path }},
+	} {
+		binaryName := target.name
+		if runtime.GOOS == "windows" {
+			binaryName += ".exe"
+		}
+		binaryPath := filepath.Join(temporaryDirectory, binaryName)
+		build := exec.Command("go", "build", "-race", "-o", binaryPath, target.path)
+		build.Dir = repositoryRoot
+		if output, err := build.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", target.name, err, output)
+			os.Exit(1)
+		}
+		target.set(binaryPath)
 	}
 
 	exitCode := m.Run()
@@ -97,28 +112,8 @@ func TestServeStatusCommandsAndShutdown(t *testing.T) {
 	core := startCore(t)
 
 	status := runMiniav(t, 2*time.Second, "status")
-	if status.exitCode != 0 || status.stdout != "core: running\nworkers: 0\n" || status.stderr != "" {
+	if status.exitCode != 0 || !strings.Contains(status.stdout, "core: running\nworkers: 2\n") || !strings.Contains(status.stdout, "scanner-a@1.0.0") || !strings.Contains(status.stdout, "state=ACTIVE") || status.stderr != "" {
 		t.Fatalf("status result = %#v", status)
-	}
-
-	commands := []struct {
-		name string
-		args []string
-	}{
-		{name: "scan", args: []string{"scan", "sample.txt"}},
-		{name: "reload", args: []string{"reload", "scanner-a", "signatures.txt"}},
-		{name: "update", args: []string{"update", "--manifest", "release.json"}},
-	}
-	for _, command := range commands {
-		t.Run(command.name, func(t *testing.T) {
-			result := runMiniav(t, 2*time.Second, command.args...)
-			if result.exitCode != 1 {
-				t.Fatalf("exit code = %d, want 1; stderr = %q", result.exitCode, result.stderr)
-			}
-			if !strings.Contains(result.stderr, command.name+" is not available until its runtime requirement is implemented") {
-				t.Fatalf("stderr = %q", result.stderr)
-			}
-		})
 	}
 
 	shutdown := runMiniav(t, 2*time.Second, "shutdown")
@@ -126,6 +121,111 @@ func TestServeStatusCommandsAndShutdown(t *testing.T) {
 		t.Fatalf("shutdown result = %#v", shutdown)
 	}
 	core.wait(t)
+}
+
+func TestScanAggregationAndReloadEndToEnd(t *testing.T) {
+	core := startCore(t)
+	cleanPath := filepath.Join(core.base, "clean.txt")
+	writeTestFile(t, cleanPath, []byte("nothing suspicious"), 0o600)
+	clean := runMiniav(t, 2*time.Second, "scan", cleanPath)
+	if clean.exitCode != 0 || !strings.Contains(clean.stdout, "verdict: CLEAN") || !strings.Contains(clean.stdout, "scanner-a@1.0.0: CLEAN") || !strings.Contains(clean.stdout, "scanner-b@1.0.0: CLEAN") {
+		t.Fatalf("clean scan = %#v", clean)
+	}
+
+	malwarePath := filepath.Join(core.base, "malware.txt")
+	writeTestFile(t, malwarePath, []byte("contains pattern-a"), 0o600)
+	malware := runMiniav(t, 2*time.Second, "scan", malwarePath)
+	if malware.exitCode != 0 || !strings.Contains(malware.stdout, "verdict: MALWARE") || !strings.Contains(malware.stdout, "signature=pattern-a") {
+		t.Fatalf("malware scan = %#v", malware)
+	}
+
+	reloadedSignatures := filepath.Join(core.base, "reloaded.txt")
+	writeTestFile(t, reloadedSignatures, []byte("new-pattern\n"), 0o600)
+	reload := runMiniav(t, 2*time.Second, "reload", "scanner-a", reloadedSignatures)
+	if reload.exitCode != 0 || !strings.Contains(reload.stdout, "reloaded scanner-a@1.0.0 signatures=1") {
+		t.Fatalf("reload = %#v", reload)
+	}
+	writeTestFile(t, malwarePath, []byte("contains new-pattern"), 0o600)
+	afterReload := runMiniav(t, 2*time.Second, "scan", malwarePath)
+	if afterReload.exitCode != 0 || !strings.Contains(afterReload.stdout, "verdict: MALWARE") || !strings.Contains(afterReload.stdout, "signature=new-pattern") {
+		t.Fatalf("scan after reload = %#v", afterReload)
+	}
+}
+
+func TestScanTimeoutAndWorkerCrashAreIsolated(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		core := startCoreConfigured(t, 50, func(workers []map[string]any) {
+			workers[1]["delayMs"] = 250
+		})
+		path := filepath.Join(core.base, "clean.txt")
+		writeTestFile(t, path, []byte("clean"), 0o600)
+		result := runMiniav(t, 2*time.Second, "scan", path)
+		if result.exitCode != 0 || !strings.Contains(result.stdout, "verdict: INCONCLUSIVE") || !strings.Contains(result.stdout, "scanner-b@1.0.0: TIMEOUT") {
+			t.Fatalf("timeout scan = %#v", result)
+		}
+		status := runMiniav(t, 2*time.Second, "status")
+		if status.exitCode != 0 || !strings.Contains(status.stdout, "scanner-b@1.0.0") {
+			t.Fatalf("status after timeout = %#v", status)
+		}
+	})
+
+	t.Run("crash", func(t *testing.T) {
+		core := startCoreConfigured(t, 500, func(workers []map[string]any) {
+			workers[1]["crashOnScan"] = true
+		})
+		path := filepath.Join(core.base, "clean.txt")
+		writeTestFile(t, path, []byte("clean"), 0o600)
+		result := runMiniav(t, 2*time.Second, "scan", path)
+		if result.exitCode != 0 || !strings.Contains(result.stdout, "verdict: INCONCLUSIVE") || !strings.Contains(result.stdout, "scanner-b@1.0.0: UNAVAILABLE") {
+			t.Fatalf("crash scan = %#v", result)
+		}
+		status := runMiniav(t, 2*time.Second, "status")
+		if status.exitCode != 0 || !strings.Contains(status.stdout, "scanner-b@1.0.0") || !strings.Contains(status.stdout, "state=FAILED") || !strings.Contains(status.stdout, "scanner-a@1.0.0") {
+			t.Fatalf("status after crash = %#v", status)
+		}
+	})
+}
+
+func TestBlueGreenUpdateAndRollbackEndToEnd(t *testing.T) {
+	core := startCoreConfigured(t, 1000, func(workers []map[string]any) {
+		workers[0]["delayMs"] = 300
+	})
+	manifestV2 := writeReleaseManifest(t, core.base, "2.0.0", scannerABinary)
+	scanPath := filepath.Join(core.base, "in-flight.txt")
+	writeTestFile(t, scanPath, []byte("clean"), 0o600)
+	scanDone := make(chan commandResult, 1)
+	go func() { scanDone <- runMiniav(t, 2*time.Second, "scan", scanPath) }()
+	time.Sleep(75 * time.Millisecond)
+	updated := runMiniav(t, 4*time.Second, "update", "--manifest", manifestV2)
+	if updated.exitCode != 0 || !strings.Contains(updated.stdout, "updated scanner-a from 1.0.0 to 2.0.0") {
+		t.Fatalf("update = %#v", updated)
+	}
+	if scan := <-scanDone; scan.exitCode != 0 || !strings.Contains(scan.stdout, "scanner-a@1.0.0: CLEAN") {
+		t.Fatalf("in-flight scan = %#v", scan)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := runMiniav(t, 2*time.Second, "status")
+		if status.exitCode == 0 && strings.Contains(status.stdout, "scanner-a@2.0.0") && strings.Contains(status.stdout, "state=ACTIVE") && strings.Contains(status.stdout, "scanner-a@1.0.0") && strings.Contains(status.stdout, "state=RETIRED") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workers did not complete cutover: %#v", status)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	broken := filepath.Join(core.base, "broken-worker")
+	writeTestFile(t, broken, []byte("not an executable"), 0o700)
+	manifestV3 := writeReleaseManifest(t, core.base, "3.0.0", broken)
+	rollback := runMiniav(t, 4*time.Second, "update", "--manifest", manifestV3)
+	if rollback.exitCode != 1 || !strings.Contains(rollback.stderr, "update rolled back") {
+		t.Fatalf("rollback = %#v", rollback)
+	}
+	status := runMiniav(t, 2*time.Second, "status")
+	if status.exitCode != 0 || !strings.Contains(status.stdout, "scanner-a@2.0.0") || !strings.Contains(status.stdout, "state=ACTIVE") {
+		t.Fatalf("status after rollback = %#v", status)
+	}
 }
 
 func TestServeRejectsInvalidConfigPaths(t *testing.T) {
@@ -229,19 +329,48 @@ type coreProcess struct {
 	done    chan error
 	stderr  *bytes.Buffer
 	waited  bool
+	base    string
 }
 
 func startCore(t *testing.T) *coreProcess {
+	return startCoreConfigured(t, 500, nil)
+}
+
+func startCoreConfigured(t *testing.T, scanTimeoutMs int, modify func([]map[string]any)) *coreProcess {
 	t.Helper()
-	configPath := filepath.Join(t.TempDir(), "miniav.toml")
-	if err := os.WriteFile(configPath, []byte("test"), 0o600); err != nil {
+	base := t.TempDir()
+	signatureA := filepath.Join(base, "scanner-a.txt")
+	signatureB := filepath.Join(base, "scanner-b.txt")
+	if err := os.WriteFile(signatureA, []byte("pattern-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signatureB, []byte("pattern-b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(base, "miniav.json")
+	workers := []map[string]any{
+		{"scannerId": "scanner-a", "workerVersion": "1.0.0", "executable": scannerABinary, "signaturePath": signatureA},
+		{"scannerId": "scanner-b", "workerVersion": "1.0.0", "executable": scannerBBinary, "signaturePath": signatureB},
+	}
+	if modify != nil {
+		modify(workers)
+	}
+	configData, err := json.Marshal(map[string]any{
+		"startupTimeoutMs": 2000,
+		"scanTimeoutMs":    scanTimeoutMs,
+		"workers":          workers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	command := exec.Command(miniavBinary, "serve", "--config", configPath)
 	stderr := &bytes.Buffer{}
 	command.Stderr = stderr
-	core := &coreProcess{command: command, done: make(chan error, 1), stderr: stderr}
+	core := &coreProcess{command: command, done: make(chan error, 1), stderr: stderr, base: base}
 	if err := command.Start(); err != nil {
 		t.Fatalf("start core: %v", err)
 	}
@@ -272,6 +401,28 @@ func startCore(t *testing.T) *coreProcess {
 	core.waited = true
 	t.Fatalf("core did not start; stderr = %q", stderr.String())
 	return nil
+}
+
+func writeReleaseManifest(t *testing.T, base string, version string, source string) string {
+	t.Helper()
+	content, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(base, "releases", "scanner-a", version, executableName("scanner-a"))
+	writeTestFile(t, artifact, content, 0o700)
+	digest := sha256.Sum256(content)
+	manifestPath := filepath.Join(base, "releases", "scanner-a", version, "manifest.json")
+	manifest := map[string]any{
+		"scannerId": "scanner-a", "workerVersion": version, "signatureVersion": "1",
+		"artifactPath": artifact, "sha256": hex.EncodeToString(digest[:]),
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, manifestPath, data, 0o600)
+	return manifestPath
 }
 
 func (core *coreProcess) wait(t *testing.T) {

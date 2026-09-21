@@ -51,11 +51,12 @@ and requests have a bounded deadline. This keeps the control path portable and
 within the standard library without conflating it with Scanner Protocol v1.
 
 FR-01 implements Core liveness/status and graceful shutdown on this transport.
-It validates the `serve` configuration path as a regular file, while the
-configuration schema remains deferred until a requirement defines it. The
-`scan`, `reload`, and `update` commands are accepted and transported but return
-an explicit unavailable response until their runtime requirements are
-implemented.
+The `serve` configuration is strict JSON with positive `startupTimeoutMs` and
+`scanTimeoutMs` values and a non-empty `workers` array. Each worker defines a
+unique `scannerId`, `workerVersion`, executable path, signature path, and
+optional fault-injection settings. Relative paths resolve from the directory
+containing the configuration file. Unknown fields, duplicate worker IDs, and
+non-regular executable or signature paths are rejected before Core listens.
 
 ### Coordinator
 
@@ -87,6 +88,13 @@ Each Core-to-Worker or Worker-to-Core message is one JSON object terminated by
 `\n`. Worker stdout is reserved for protocol frames. Human-readable and
 structured diagnostics go to stderr through `log/slog` so they cannot corrupt
 the protocol stream.
+
+`pkg/worker` implements the shared Scanner Protocol v1 runtime used by
+`cmd/scanner-a` and `cmd/scanner-b`. Each command supplies its scanner identity,
+while flags provide the worker version, initial signature database, and the
+documented fault-injection behavior. The worker accepts only Core-to-Worker
+message types, handles scans concurrently, serializes protocol responses, and
+waits for in-flight scans before acknowledging shutdown.
 
 ### Signature engine
 

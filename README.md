@@ -17,24 +17,12 @@ concurrency, health-gated activation, graceful draining, and rollback.
 
 ## Project status
 
-FR-01 through FR-07 capability layers are implemented. The `miniav` binary provides the complete
-command surface, a loopback-only Core control endpoint, status reporting, and
-graceful shutdown. The protocol and IPC packages provide validated Scanner
-Protocol v1 messages, bounded NDJSON framing, and the five defined per-worker
-verdicts. The process and coordinator packages provide child-process spawning,
-bounded candidate termination, version-aware lifecycle and routing state,
-isolated worker failure handling, and `UNAVAILABLE` results for pending worker
-requests. The update package strictly validates local release manifests,
-verifies SHA-256 digests, and publishes immutable staged artifacts. The
-signatures package provides UTF-8 database loading, literal streaming matches,
-immutable snapshots, and atomic reloads. The aggregator package provides the
-pure `ANY_MALICIOUS` policy.
-
-Worker executables, worker configuration, Scanner Protocol handshake and health
-orchestration, scan routing, timeouts, Core-to-worker reload routing, and CLI
-update wiring remain pending runtime integration. The aggregation policy is not
-yet connected to the scan command, so `scan`, `reload`, and `update` continue to
-return a clear unavailable error from Core.
+FR-01 through FR-07 are implemented end to end. Core starts configured worker
+processes, gates activation on handshake and health checks, scans with every
+active engine, substitutes timeout and unavailable results, reloads signatures,
+and performs health-gated blue/green updates from SHA-256-verified local
+manifests. Worker crashes remain isolated and pre-activation update failures
+leave the active version in place.
 
 ## Hot-swap model
 
@@ -112,10 +100,11 @@ miniav shutdown
 | `update` | Validate and activate a new worker release. |
 | `shutdown` | Gracefully stop Core and reap all child processes. |
 
-Start Core with an existing regular file as the configuration path:
+Build Core and both workers, then start Core with the supplied configuration:
 
 ```sh
-go run ./cmd/miniav serve --config <path>
+make build
+./miniav serve --config config/miniav.json
 ```
 
 Alternatively, build the platform-specific `miniav` executable in the
@@ -132,10 +121,15 @@ go run ./cmd/miniav status
 go run ./cmd/miniav shutdown
 ```
 
-Core listens on the loopback-only control address `127.0.0.1:7331`. FR-01
-reserves configuration parsing for the requirement that defines the schema, so
-the current `serve` command validates that the supplied path is a regular file
-without interpreting its contents.
+Core listens on the loopback-only control address `127.0.0.1:7331`. On a
+non-Windows host, remove the `.exe` suffixes from the executable paths in the
+sample configuration. Relative paths in configuration, scan, reload, and
+manifest commands resolve from the configuration directory.
+
+The strict JSON configuration contains positive `startupTimeoutMs` and
+`scanTimeoutMs` values plus a non-empty worker list. Workers also accept
+optional `delayMs`, `crashOnScan`, and `failHealth` fields for local fault
+injection.
 
 ## Development commands
 
@@ -198,9 +192,7 @@ The `aggregator` package implements the `ANY_MALICIOUS` policy:
 3. If every worker returns `CLEAN`, the combined verdict is `CLEAN`.
 
 `INCONCLUSIVE` is a combined result rather than a per-worker protocol verdict.
-Aggregation rejects an empty set, pending results, and unknown verdicts. The
-policy is not yet wired to the scan command because worker startup and scan
-routing remain pending.
+Aggregation rejects an empty set, pending results, and unknown verdicts.
 
 Scanned files are opened read-only and are never executed.
 
@@ -213,9 +205,8 @@ prepares and validates a new immutable database before atomically publishing
 it; a failed reload leaves the current database unchanged. A scan already in
 progress finishes against the immutable snapshot it acquired before a reload.
 
-The signature store is implemented as a reusable worker component. The Core
-`reload` command remains unavailable until worker startup and routing are
-implemented.
+The `reload` command routes the new path to the selected active worker and
+reports the published signature count.
 
 ## Worker releases
 
@@ -233,9 +224,21 @@ eligible for activation only after its runtime reports successful handshake and
 health events to the coordinator. Startup, handshake, health, or timeout
 failure marks only the candidate failed and leaves the previous worker active.
 After activation, the old version drains its assigned requests before
-retirement. Automatic rollback after activation is intentionally not part of
-FR-07, and the CLI `update` command remains unavailable until worker runtime
-wiring exists.
+retirement. An unexpected exit after activation follows normal failure
+isolation and does not reactivate an already draining generation.
+
+## Local demonstration
+
+Run the complete scenario from PowerShell:
+
+```powershell
+.\demo.ps1
+```
+
+The script builds all binaries, starts two workers, demonstrates clean and
+malicious aggregation, reloads Scanner A, performs an in-flight v1-to-v2
+cutover, rejects a broken v3 artifact while retaining v2, verifies the stable
+Core PID, and shuts the system down.
 
 ## Requirements
 
@@ -243,8 +246,7 @@ wiring exists.
 - Windows x64, Linux, or macOS
 - No third-party Go modules or native toolchain dependencies
 
-Once implementation packages are present, the standard verification commands
-will be:
+The standard verification commands are:
 
 ```sh
 gofmt -w <changed-go-files>
@@ -255,15 +257,15 @@ go test -race ./...
 
 ## Roadmap
 
-- [ ] Standalone scanner
+- [x] Standalone scanner
 - [x] Signature database, streaming matching, and atomic reload
 - [x] Scanner Protocol v1 over standard streams
 - [x] Child-process supervision and crash isolation
 - [x] Coordinator state tracking and result aggregation policy
 - [x] Manifest validation, immutable staging, and pre-activation rollback state
-- [ ] Worker runtime and multi-worker scan routing
-- [ ] Blue/green worker updates and rollback
-- [ ] End-to-end local demonstration
+- [x] Worker runtime and multi-worker scan routing
+- [x] Blue/green worker updates and rollback
+- [x] End-to-end local demonstration
 
 ## Non-goals
 
